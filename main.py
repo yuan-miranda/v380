@@ -1,0 +1,243 @@
+import cv2
+import threading
+import time
+from flask import Flask, request, render_template_string
+from datetime import datetime
+import os
+import requests
+
+app = Flask(__name__)
+
+
+def load_env_file(filename=".env"):
+    if not os.path.exists(filename):
+        return
+
+    with open(filename, encoding="utf-8") as env_file:
+        for line in env_file:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            value = value.strip().strip('"').strip("'")
+            os.environ.setdefault(key.strip(), value)
+
+
+load_env_file()
+
+current_frame = None
+frame_lock = threading.Lock()
+RTSP_URL = os.getenv("RTSP_URL", "")
+VPS_ENDPOINT = os.getenv("VPS_ENDPOINT", "")
+VPS_TOKEN = os.getenv("VPS_TOKEN", "")
+VIDEO_DURATION_SECONDS = int(os.getenv("VIDEO_DURATION_SECONDS", "60"))
+
+# PhilSMS Configuration
+PHILSMS_URL = os.getenv("PHILSMS_URL", "https://dashboard.philsms.com/api/v3/sms/send")
+PHILSMS_TOKEN = os.getenv("PHILSMS_TOKEN", "")
+TARGET_MOBILE = os.getenv("TARGET_MOBILE", "")
+SENDER_ID = os.getenv("SENDER_ID", "PhilSMS")
+PRODUCT_NAME = os.getenv("PRODUCT_NAME", "Alerto")
+
+
+def capture_stream():
+    global current_frame
+    while True:
+        cap = cv2.VideoCapture(RTSP_URL)
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+            with frame_lock:
+                current_frame = frame.copy()
+        cap.release()
+
+
+threading.Thread(target=capture_stream, daemon=True).start()
+
+
+def record_and_upload(button_id):
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    filename = os.path.abspath(f"evidence_btn{button_id}_{timestamp}.mp4")
+    cap = cv2.VideoCapture(RTSP_URL)
+    writer = None
+
+    try:
+        if not cap.isOpened():
+            raise RuntimeError("Could not open the RTSP stream")
+
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if not fps or fps <= 0 or fps > 120:
+            fps = 20.0
+
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if width <= 0 or height <= 0:
+            raise RuntimeError("Could not determine the video dimensions")
+
+        writer = cv2.VideoWriter(
+            filename,
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            fps,
+            (width, height),
+        )
+        if not writer.isOpened():
+            raise RuntimeError("Could not create the video file")
+
+        deadline = time.monotonic() + VIDEO_DURATION_SECONDS
+        while time.monotonic() < deadline:
+            ret, frame = cap.read()
+            if not ret:
+                raise RuntimeError("Lost the RTSP stream while recording")
+            writer.write(frame)
+    except Exception as error:
+        print(f"Video recording error: {error}")
+        if os.path.exists(filename):
+            os.remove(filename)
+        return
+    finally:
+        cap.release()
+        if writer is not None:
+            writer.release()
+
+    if not VPS_ENDPOINT:
+        print(f"Video saved locally: {filename} (VPS_ENDPOINT is not configured)")
+        return
+
+    headers = {"Authorization": f"Bearer {VPS_TOKEN}"} if VPS_TOKEN else {}
+    try:
+        with open(filename, "rb") as video_file:
+            response = requests.post(
+                VPS_ENDPOINT,
+                files={"video": (os.path.basename(filename), video_file, "video/mp4")},
+                headers=headers,
+                timeout=120,
+            )
+        response.raise_for_status()
+        print(f"Video uploaded: {filename} | Status: {response.status_code}")
+    except Exception as error:
+        print(f"Video upload error: {error}")
+
+# Modern, Professional Mobile-Centric UI Template
+WEB_PAGE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Alerto Emergency Alert System</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        :root { color-scheme: light; }
+        * { box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; text-align: center; margin: 0; min-height: 100dvh; background: #e2e8f0; }
+        .container { background: #f8fafc; min-height: 100dvh; width: 100%; padding: max(32px, env(safe-area-inset-top)) max(20px, env(safe-area-inset-right)) max(28px, env(safe-area-inset-bottom)) max(20px, env(safe-area-inset-left)); display: flex; flex-direction: column; justify-content: center; align-items: center; overflow: hidden; }
+        h2 { color: #1e293b; margin: 0 0 8px; font-size: clamp(26px, 7vw, 36px); }
+        p { color: #64748b; font-size: 15px; margin: 0 auto 32px; max-width: 28rem; }
+        .button-stack { display: flex; flex-direction: column; gap: 16px; width: 100%; max-width: 34rem; margin: 0 auto; }
+        button { width: 100%; height: clamp(160px, 38vw, 220px); padding: 18px; font-size: clamp(21px, 6vw, 28px); color: white; border: none; border-radius: 0; cursor: pointer; font-weight: 700; box-shadow: none; transition: transform 0.1s ease, opacity 0.2s; touch-action: manipulation; }
+        button:active { transform: scale(0.98); opacity: 0.9; }
+        
+        /* Professional, non-goofy color palette */
+        .btn-hazard { background: #d97706; }    /* Amber/Orange */
+        .btn-security { background: #b91c1c; }  /* Deep Crimson Red */
+        .btn-medical { background: #047857; }   /* Professional Emerald Green */
+        
+        #status { margin: 0; max-width: 34rem; font-weight: 500; color: #334155; font-size: 15px; line-height: 1.4; min-height: 0; }
+        .location { width: 100%; max-width: 34rem; margin: 18px auto 0; color: #64748b; font-size: clamp(11px, 3.2vw, 14px); line-height: 1.4; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: center; }
+        @media (min-width: 700px) {
+            .container { padding: 48px; }
+            .button-stack { gap: 18px; }
+            button { height: 220px; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>{{ product_name }} Reporter</h2>
+        
+        <div class="button-stack">
+            <!-- Button 1: Hazard -->
+            <button class="btn-hazard" onclick="triggerAlert(1)">Hazard</button>
+            
+            <!-- Button 2: Security -->
+            <button class="btn-security" onclick="triggerAlert(2)">Security</button>
+            
+            <!-- Button 3: Medical Concern -->
+            <button class="btn-medical" onclick="triggerAlert(3)">Medical Concern</button>
+        </div>
+        
+        <div id="status"></div>
+
+        <div class="location">STEM Department Building &bull; STEM 12 Newton Room</div>
+    </div>
+
+    <script>
+        function triggerAlert(buttonId) {
+            document.getElementById("status").innerText = "Transmitting alert and securing evidence...";
+            fetch('/trigger-alert?button=' + buttonId)
+                .then(response => response.text)
+                .then(data => {
+                    document.getElementById("status").innerText = "Alert dispatched successfully. Authorities notified.";
+                })
+                .catch(error => {
+                    document.getElementById("status").innerText = "Transmission failed. Check network connection.";
+                    console.error('Error:', error);
+                });
+        }
+    </script>
+</body>
+</html>
+"""
+
+
+@app.route("/")
+def home():
+    return render_template_string(WEB_PAGE, product_name=PRODUCT_NAME)
+
+
+@app.route("/trigger-alert", methods=["GET"])
+def trigger_alert():
+    button_id = request.args.get("button", "unknown")
+
+    categories = {"1": "Hazard", "2": "Security", "3": "Medical Concern"}
+    category_name = categories.get(button_id, "General Emergency")
+    current_time = datetime.now().strftime("%B %d, %Y - %I:%M %p")
+
+    threading.Thread(
+        target=record_and_upload,
+        args=(button_id,),
+        daemon=True,
+    ).start()
+
+    sms_text = (
+        f"{PRODUCT_NAME} EMERGENCY ALERT\n\n"
+        f"Category: {category_name}\n"
+        f"Location: STEM Department Building – STEM 12 Newton Room\n"
+        f"Time: {current_time}\n\n"
+        f"An emergency alert has been activated. Please proceed to the indicated location immediately and assess the situation. Visual incident documentation will be transmitted for review.\n\n"
+        f"— {PRODUCT_NAME} Emergency Alert System"
+    )
+
+    payload = {
+        "recipient": TARGET_MOBILE,
+        "sender_id": SENDER_ID,
+        "type": "plain",
+        "message": sms_text,
+    }
+
+    headers = {
+        "Authorization": f"Bearer {PHILSMS_TOKEN}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+    try:
+        response = requests.post(PHILSMS_URL, json=payload, headers=headers)
+        print(f"Alert Dispatched | Status: {response.status_code}")
+        return response.text, response.status_code
+    except Exception as e:
+        print(f"SMS Dispatch Error: {str(e)}")
+        return str(e), 500
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=False)
