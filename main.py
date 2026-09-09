@@ -29,6 +29,7 @@ def load_env_file(filename=".env"):
 load_env_file()
 
 current_frame = None
+stream_available = False
 frame_lock = threading.Lock()
 RTSP_URL = os.getenv("RTSP_URL", "")
 LOCAL_CAMERA_INDEX = int(os.getenv("LOCAL_CAMERA_INDEX", "0"))
@@ -79,12 +80,17 @@ def open_video_source():
 
 
 def capture_stream():
-    global current_frame
+    global current_frame, stream_available
     while True:
         cap = open_video_source()
         if cap is None:
+            with frame_lock:
+                current_frame = None
+                stream_available = False
             print("No CCTV or device camera available; video capture disabled")
             return
+        with frame_lock:
+            stream_available = True
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
@@ -92,6 +98,9 @@ def capture_stream():
             with frame_lock:
                 current_frame = frame.copy()
         cap.release()
+        with frame_lock:
+            current_frame = None
+            stream_available = False
 
 
 threading.Thread(target=capture_stream, daemon=True).start()
@@ -432,7 +441,7 @@ def trigger_alert():
         f"evidence_btn{button_id}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.mp4"
     )
     with frame_lock:
-        video_available = current_frame is not None
+        video_available = stream_available and current_frame is not None
 
     threading.Thread(
         target=record_and_upload,
