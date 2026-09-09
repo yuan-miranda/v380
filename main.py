@@ -1,9 +1,7 @@
-import cv2
 import json
 import shutil
 import subprocess
 import threading
-import tempfile
 import time
 from flask import Flask, jsonify, request, render_template_string
 from datetime import datetime
@@ -46,15 +44,13 @@ def load_config_file():
 
 FILE_CONFIG = load_config_file()
 
-current_frame = None
-stream_available = False
-frame_lock = threading.Lock()
 RTSP_URL = os.getenv("RTSP_URL", "")
-LOCAL_CAMERA_INDEX = int(os.getenv("LOCAL_CAMERA_INDEX", "0"))
-CCTV_TIMEOUT_MILLISECONDS = int(os.getenv("CCTV_TIMEOUT_MILLISECONDS", "3000"))
 FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg")
 VPS_ENDPOINT = os.getenv("VPS_ENDPOINT", "")
 VPS_TOKEN = os.getenv("VPS_TOKEN", "")
+VPS_EVENT_ENDPOINT = os.getenv("VPS_EVENT_ENDPOINT", "")
+VPS_EVENT_TOKEN = os.getenv("VPS_EVENT_TOKEN", VPS_TOKEN)
+POLL_INTERVAL_SECONDS = float(os.getenv("POLL_INTERVAL_SECONDS", "2"))
 VIDEO_URL_BASE = os.getenv("VIDEO_URL_BASE", "")
 VIDEO_URL_TOKEN = os.getenv("VIDEO_URL_TOKEN", "")
 VIDEO_PLACEHOLDER_URL = os.getenv("VIDEO_PLACEHOLDER_URL", "")
@@ -77,59 +73,31 @@ def save_config_file(settings):
         config_file.write("\n")
 
 
-def open_video_source():
-    if RTSP_URL:
-        try:
-            cctv = cv2.VideoCapture(
-                RTSP_URL,
-                cv2.CAP_FFMPEG,
-                [
-                    cv2.CAP_PROP_OPEN_TIMEOUT_MSEC,
-                    CCTV_TIMEOUT_MILLISECONDS,
-                    cv2.CAP_PROP_READ_TIMEOUT_MSEC,
-                    CCTV_TIMEOUT_MILLISECONDS,
-                ],
-            )
-        except (TypeError, cv2.error):
-            cctv = cv2.VideoCapture(RTSP_URL)
-        if cctv.isOpened():
-            print("Using CCTV stream")
-            return cctv
-        cctv.release()
+def poll_vps_events():
+    if not VPS_EVENT_ENDPOINT:
+        return
 
-    device_camera = cv2.VideoCapture(LOCAL_CAMERA_INDEX)
-    if device_camera.isOpened():
-        print(f"CCTV unavailable; using device camera {LOCAL_CAMERA_INDEX}")
-        return device_camera
-    device_camera.release()
-    return None
-
-
-def capture_stream():
-    global current_frame, stream_available
+    headers = {"Authorization": f"Bearer {VPS_EVENT_TOKEN}"}
+    local_trigger_url = "http://127.0.0.1:5000/trigger-alert"
     while True:
-        cap = open_video_source()
-        if cap is None:
-            with frame_lock:
-                current_frame = None
-                stream_available = False
-            print("No CCTV or device camera available; video capture disabled")
-            return
-        with frame_lock:
-            stream_available = True
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
-            with frame_lock:
-                current_frame = frame.copy()
-        cap.release()
-        with frame_lock:
-            current_frame = None
-            stream_available = False
+        try:
+            response = requests.get(VPS_EVENT_ENDPOINT, headers=headers, timeout=10)
+            response.raise_for_status()
+            event = response.json().get("event")
+            if event:
+                button_id = str(event.get("button", ""))
+                if button_id in {"1", "2", "3"}:
+                    requests.get(
+                        local_trigger_url,
+                        params={"button": button_id},
+                        timeout=10,
+                    )
+        except (requests.RequestException, ValueError) as error:
+            print(f"VPS event polling error: {error}")
+        time.sleep(POLL_INTERVAL_SECONDS)
 
 
-threading.Thread(target=capture_stream, daemon=True).start()
+threading.Thread(target=poll_vps_events, daemon=True).start()
 
 
 def record_cctv_stream(filename, duration_seconds):
@@ -203,78 +171,7 @@ def record_and_upload(button_id, filename, duration_seconds):
     if record_cctv_stream(filename, duration_seconds):
         upload_video_file(filename)
         return
-
-    recording_error = None
-    snapshot_dir = None
-
-    try:
-        with frame_lock:
-            first_frame = None if current_frame is None else current_frame.copy()
-        if first_frame is None:
-            raise RuntimeError("Could not read frames from the CCTV stream or device camera")
-        height, width = first_frame.shape[:2]
-        fps = 20.0
-        if shutil.which(FFMPEG_PATH) is None:
-            raise RuntimeError("FFmpeg is required to build a video from snapshots")
-        snapshot_dir = tempfile.mkdtemp(prefix="video_frames_")
-        frame_number = 0
-
-        deadline = time.monotonic() + duration_seconds
-        while time.monotonic() < deadline:
-            with frame_lock:
-                frame = None if current_frame is None else current_frame.copy()
-            if frame is None:
-                time.sleep(0.05)
-                continue
-            time.sleep(1 / fps)
-            frame_path = os.path.join(snapshot_dir, f"frame_{frame_number:06d}.jpg")
-            if not cv2.imwrite(frame_path, frame):
-                raise RuntimeError("Could not save a camera snapshot")
-            frame_number += 1
-    except Exception as error:
-        recording_error = error
-
-    if recording_error is None:
-        try:
-            encode_result = subprocess.run(
-                [
-                    FFMPEG_PATH,
-                    "-y",
-                    "-framerate",
-                    str(fps),
-                    "-i",
-                    os.path.join(snapshot_dir, "frame_%06d.jpg"),
-                    "-c:v",
-                    "libx264",
-                    "-pix_fmt",
-                    "yuv420p",
-                    "-movflags",
-                    "+faststart",
-                    filename,
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                check=False,
-                text=True,
-            )
-            if encode_result.returncode != 0:
-                recording_error = RuntimeError("FFmpeg could not assemble the camera snapshots")
-        except Exception as error:
-            recording_error = error
-
-    if snapshot_dir is not None:
-        shutil.rmtree(snapshot_dir, ignore_errors=True)
-
-    if recording_error is not None:
-        print(f"Video recording error: {recording_error}")
-        if os.path.exists(filename):
-            try:
-                os.remove(filename)
-            except OSError as error:
-                print(f"Could not remove incomplete video: {error}")
-        return
-
-    upload_video_file(filename)
+    print("Video recording error: CCTV RTSP stream could not be recorded")
 
 
 def video_url(filename, video_available):
@@ -503,8 +400,7 @@ def trigger_alert():
     video_filename = os.path.abspath(
         f"evidence_btn{button_id}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.mp4"
     )
-    with frame_lock:
-        video_available = stream_available and current_frame is not None
+    video_available = bool(RTSP_URL) and shutil.which(FFMPEG_PATH) is not None
 
     threading.Thread(
         target=record_and_upload,

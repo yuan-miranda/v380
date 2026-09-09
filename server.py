@@ -1,4 +1,5 @@
 import os
+import threading
 from pathlib import Path
 
 from flask import Flask, abort, jsonify, request, send_from_directory
@@ -28,6 +29,9 @@ UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "/root/video/uploads"))
 if not UPLOAD_DIR.is_absolute():
     UPLOAD_DIR = Path(__file__).resolve().parent / UPLOAD_DIR
 MAX_UPLOAD_SIZE = int(os.getenv("MAX_UPLOAD_SIZE", str(500 * 1024 * 1024)))
+EVENT_TOKEN = os.getenv("EVENT_TOKEN", UPLOAD_TOKEN)
+pending_events = []
+events_lock = threading.Lock()
 
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_SIZE
@@ -46,6 +50,33 @@ def has_view_token():
 @app.get("/")
 def home():
     return "Video upload server is running."
+
+
+@app.post("/events")
+def create_event():
+    if not has_token(EVENT_TOKEN):
+        return jsonify(error="Unauthorized"), 401
+
+    data = request.get_json(silent=True) or {}
+    button_id = str(data.get("button", "")).strip()
+    if button_id not in {"1", "2", "3"}:
+        return jsonify(error="button must be 1, 2, or 3"), 400
+
+    with events_lock:
+        pending_events.append({"button": button_id})
+    return jsonify(message="Event queued"), 202
+
+
+@app.get("/events/next")
+def next_event():
+    if not has_token(EVENT_TOKEN):
+        return jsonify(error="Unauthorized"), 401
+
+    with events_lock:
+        if not pending_events:
+            return jsonify(event=None), 200
+        event = pending_events.pop(0)
+    return jsonify(event=event), 200
 
 
 @app.post("/upload")
