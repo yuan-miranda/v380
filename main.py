@@ -36,6 +36,9 @@ CCTV_TIMEOUT_MILLISECONDS = int(os.getenv("CCTV_TIMEOUT_MILLISECONDS", "3000"))
 FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg")
 VPS_ENDPOINT = os.getenv("VPS_ENDPOINT", "")
 VPS_TOKEN = os.getenv("VPS_TOKEN", "")
+VIDEO_URL_BASE = os.getenv("VIDEO_URL_BASE", "")
+VIDEO_URL_TOKEN = os.getenv("VIDEO_URL_TOKEN", "")
+VIDEO_PLACEHOLDER_URL = os.getenv("VIDEO_PLACEHOLDER_URL", "")
 VIDEO_DURATION_SECONDS = int(os.getenv("VIDEO_DURATION_SECONDS", "60"))
 
 # PhilSMS Configuration
@@ -80,8 +83,8 @@ def capture_stream():
     while True:
         cap = open_video_source()
         if cap is None:
-            time.sleep(2)
-            continue
+            print("No CCTV or device camera available; video capture disabled")
+            return
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
@@ -94,7 +97,7 @@ def capture_stream():
 threading.Thread(target=capture_stream, daemon=True).start()
 
 
-def record_cctv_stream(filename):
+def record_cctv_stream(filename, duration_seconds):
     if not RTSP_URL or shutil.which(FFMPEG_PATH) is None:
         return False
 
@@ -106,7 +109,7 @@ def record_cctv_stream(filename):
         "-i",
         RTSP_URL,
         "-t",
-        str(VIDEO_DURATION_SECONDS),
+        str(duration_seconds),
         "-map",
         "0",
         "-c",
@@ -121,7 +124,7 @@ def record_cctv_stream(filename):
             command,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
-            timeout=VIDEO_DURATION_SECONDS + 15,
+            timeout=duration_seconds + 15,
             check=False,
             text=True,
         )
@@ -138,6 +141,10 @@ def record_cctv_stream(filename):
 
 
 def upload_video_file(filename):
+    if not os.path.isfile(filename) or os.path.getsize(filename) == 0:
+        print(f"Skipping empty or missing video: {filename}")
+        return
+
     if not VPS_ENDPOINT:
         print(f"Video saved locally: {filename} (VPS_ENDPOINT is not configured)")
         return
@@ -157,11 +164,8 @@ def upload_video_file(filename):
         print(f"Video upload error: {error}")
 
 
-def record_and_upload(button_id):
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    filename = os.path.abspath(f"evidence_btn{button_id}_{timestamp}.mp4")
-
-    if record_cctv_stream(filename):
+def record_and_upload(button_id, filename, duration_seconds):
+    if record_cctv_stream(filename, duration_seconds):
         upload_video_file(filename)
         return
 
@@ -180,7 +184,7 @@ def record_and_upload(button_id):
         snapshot_dir = tempfile.mkdtemp(prefix="video_frames_")
         frame_number = 0
 
-        deadline = time.monotonic() + VIDEO_DURATION_SECONDS
+        deadline = time.monotonic() + duration_seconds
         while time.monotonic() < deadline:
             with frame_lock:
                 frame = None if current_frame is None else current_frame.copy()
@@ -196,29 +200,32 @@ def record_and_upload(button_id):
         recording_error = error
 
     if recording_error is None:
-        encode_result = subprocess.run(
-            [
-                FFMPEG_PATH,
-                "-y",
-                "-framerate",
-                str(fps),
-                "-i",
-                os.path.join(snapshot_dir, "frame_%06d.jpg"),
-                "-c:v",
-                "libx264",
-                "-pix_fmt",
-                "yuv420p",
-                "-movflags",
-                "+faststart",
-                filename,
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            check=False,
-            text=True,
-        )
-        if encode_result.returncode != 0:
-            recording_error = RuntimeError("FFmpeg could not assemble the camera snapshots")
+        try:
+            encode_result = subprocess.run(
+                [
+                    FFMPEG_PATH,
+                    "-y",
+                    "-framerate",
+                    str(fps),
+                    "-i",
+                    os.path.join(snapshot_dir, "frame_%06d.jpg"),
+                    "-c:v",
+                    "libx264",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-movflags",
+                    "+faststart",
+                    filename,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                check=False,
+                text=True,
+            )
+            if encode_result.returncode != 0:
+                recording_error = RuntimeError("FFmpeg could not assemble the camera snapshots")
+        except Exception as error:
+            recording_error = error
 
     if snapshot_dir is not None:
         shutil.rmtree(snapshot_dir, ignore_errors=True)
@@ -234,6 +241,13 @@ def record_and_upload(button_id):
 
     upload_video_file(filename)
 
+
+def video_url(filename, video_available):
+    if not video_available:
+        return VIDEO_PLACEHOLDER_URL
+    token = f"?token={VIDEO_URL_TOKEN}" if VIDEO_URL_TOKEN else ""
+    return f"{VIDEO_URL_BASE.rstrip('/')}/{os.path.basename(filename)}{token}"
+
 # Modern, Professional Mobile-Centric UI Template
 WEB_PAGE = """
 <!DOCTYPE html>
@@ -246,7 +260,8 @@ WEB_PAGE = """
         * { box-sizing: border-box; }
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; text-align: center; margin: 0; min-height: 100dvh; background: #e2e8f0; }
         .container { background: #f8fafc; min-height: 100dvh; width: 100%; padding: max(32px, env(safe-area-inset-top)) max(20px, env(safe-area-inset-right)) max(28px, env(safe-area-inset-bottom)) max(20px, env(safe-area-inset-left)); display: flex; flex-direction: column; justify-content: center; align-items: center; overflow: hidden; }
-        h2 { color: #1e293b; margin: 0 0 8px; font-size: clamp(26px, 7vw, 36px); }
+        h2 { color: #0f172a; margin: 0 0 8px; font-family: Georgia, "Times New Roman", serif; font-size: clamp(28px, 7vw, 38px); font-weight: 700; letter-spacing: 0; line-height: 1.1; }
+        .subtitle { color: #64748b; margin: 0 0 30px; font-size: 14px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; }
         p { color: #64748b; font-size: 15px; margin: 0 auto 32px; max-width: 28rem; }
         .button-stack { display: flex; flex-direction: column; gap: 16px; width: 100%; max-width: 34rem; margin: 0 auto; }
         button { width: 100%; height: clamp(160px, 38vw, 220px); padding: 18px; font-size: clamp(21px, 6vw, 28px); color: white; border: none; border-radius: 0; cursor: pointer; font-weight: 700; box-shadow: none; transition: transform 0.1s ease, opacity 0.2s; touch-action: manipulation; }
@@ -257,7 +272,26 @@ WEB_PAGE = """
         .btn-security { background: #b91c1c; }  /* Deep Crimson Red */
         .btn-medical { background: #047857; }   /* Professional Emerald Green */
         
-        #status { margin: 0; max-width: 34rem; font-weight: 500; color: #334155; font-size: 15px; line-height: 1.4; min-height: 0; }
+        .activity-log { width: 100%; max-width: 34rem; margin: 24px auto 0; border: 1px solid #cbd5e1; background: #ffffff; text-align: left; }
+        .log-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 12px 14px; border-bottom: 1px solid #e2e8f0; color: #1e293b; font-size: 13px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; }
+        .log-state { cursor: default; opacity: 1; }
+        #status { min-height: 54px; max-height: 150px; overflow-y: auto; }
+        .log-empty, .log-entry { padding: 11px 14px; font-size: 13px; line-height: 1.35; }
+        .log-empty { color: #64748b; }
+        .log-entry { display: flex; gap: 10px; border-bottom: 1px solid #f1f5f9; color: #334155; }
+        .log-entry:last-child { border-bottom: 0; }
+        .log-time { flex: 0 0 auto; color: #94a3b8; font-variant-numeric: tabular-nums; }
+        .log-entry.success .log-message { color: #047857; }
+        .log-entry.error .log-message { color: #b91c1c; }
+        .log-entry.pending .log-message { color: #b45309; }
+        .log-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+        .log-action { height: auto; width: auto; padding: 5px 8px; background: #e2e8f0; color: #334155; font-size: 11px; font-weight: 700; }
+        .log-action:hover { background: #cbd5e1; }
+        .configuration { display: none; width: 100%; max-width: 34rem; margin: 10px auto 0; padding: 14px; border: 1px solid #cbd5e1; background: #ffffff; text-align: left; }
+        .configuration.open { display: block; }
+        .configuration label { display: block; margin-bottom: 5px; color: #334155; font-size: 12px; font-weight: 700; }
+        .configuration input { width: 100%; margin-bottom: 12px; padding: 9px 10px; border: 1px solid #cbd5e1; color: #1e293b; font: inherit; }
+        .config-save { height: auto; width: auto; padding: 9px 12px; background: #0f766e; font-size: 12px; }
         .location { width: 100%; max-width: 34rem; margin: 18px auto 0; color: #64748b; font-size: clamp(11px, 3.2vw, 14px); line-height: 1.4; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: center; }
         @media (min-width: 700px) {
             .container { padding: 48px; }
@@ -268,7 +302,8 @@ WEB_PAGE = """
 </head>
 <body>
     <div class="container">
-        <h2>{{ product_name }} Reporter</h2>
+        <h2>{{ product_name }}</h2>
+        <p class="subtitle">Emergency Reporting System</p>
         
         <div class="button-stack">
             <!-- Button 1: Hazard -->
@@ -281,21 +316,87 @@ WEB_PAGE = """
             <button class="btn-medical" onclick="triggerAlert(3)">Medical Concern</button>
         </div>
         
-        <div id="status"></div>
+        <section class="activity-log" aria-live="polite">
+            <div class="log-header">
+                <span>Activity log</span>
+                <div class="log-actions">
+                    <button class="log-action log-state" id="log-state" type="button" disabled>Ready</button>
+                    <button class="log-action" type="button" onclick="clearLog()">Clear log</button>
+                    <button class="log-action" type="button" onclick="toggleConfiguration()">Configuration</button>
+                </div>
+            </div>
+            <div id="status">
+                <div class="log-empty">No alerts recorded in this session.</div>
+            </div>
+        </section>
+
+        <form class="configuration" id="configuration" onsubmit="saveConfiguration(event)">
+            <label for="duration">Video duration (seconds)</label>
+            <input id="duration" type="number" min="1" max="300" value="{{ video_duration }}" required>
+            <label for="recipient">SMS recipient number</label>
+            <input id="recipient" type="tel" value="{{ target_mobile }}" placeholder="639XXXXXXXXX" required>
+            <button class="config-save" type="submit">Save configuration</button>
+        </form>
 
         <div class="location">STEM Department Building &bull; STEM 12 Newton Room</div>
     </div>
 
     <script>
+        const alertConfiguration = {
+            duration: Number(document.getElementById("duration").value),
+            recipient: document.getElementById("recipient").value
+        };
+
+        function toggleConfiguration() {
+            document.getElementById("configuration").classList.toggle("open");
+        }
+
+        function saveConfiguration(event) {
+            event.preventDefault();
+            alertConfiguration.duration = Number(document.getElementById("duration").value);
+            alertConfiguration.recipient = document.getElementById("recipient").value.trim();
+            document.getElementById("configuration").classList.remove("open");
+            addLog("Configuration saved: " + alertConfiguration.duration + " second video; recipient " + alertConfiguration.recipient + ".", "success");
+        }
+
+        function clearLog() {
+            document.getElementById("status").innerHTML = '<div class="log-empty">No alerts recorded in this session.</div>';
+            document.getElementById("log-state").innerText = "Ready";
+        }
+
+        function addLog(message, level) {
+            const status = document.getElementById("status");
+            const empty = status.querySelector(".log-empty");
+            if (empty) empty.remove();
+
+            const entry = document.createElement("div");
+            entry.className = "log-entry " + level;
+            entry.innerHTML = '<span class="log-time">' + new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) + '</span>' +
+                '<span class="log-message">' + message + '</span>';
+            status.prepend(entry);
+        }
+
         function triggerAlert(buttonId) {
-            document.getElementById("status").innerText = "Transmitting alert and securing evidence...";
-            fetch('/trigger-alert?button=' + buttonId)
-                .then(response => response.text)
-                .then(data => {
-                    document.getElementById("status").innerText = "Alert dispatched successfully. Authorities notified.";
+            const category = { 1: "Hazard", 2: "Security", 3: "Medical concern" }[buttonId] || "General emergency";
+            document.getElementById("log-state").innerText = "Working";
+            addLog(category + " alert queued; evidence capture started.", "pending");
+            const query = new URLSearchParams({
+                button: buttonId,
+                duration: String(alertConfiguration.duration),
+                recipient: alertConfiguration.recipient
+            });
+            fetch('/trigger-alert?' + query.toString())
+                .then(response => {
+                    if (!response.ok) throw new Error("Server returned HTTP " + response.status);
+                    return response.text();
+                })
+                .then(() => {
+                    document.getElementById("log-state").innerText = "Ready";
+                    addLog(category + " alert accepted; SMS dispatch completed.", "success");
                 })
                 .catch(error => {
-                    document.getElementById("status").innerText = "Transmission failed. Check network connection.";
+                    document.getElementById("log-state").innerText = "Attention";
+                    addLog(category + " alert was not confirmed: " + error.message, "error");
                     console.error('Error:', error);
                 });
         }
@@ -307,20 +408,35 @@ WEB_PAGE = """
 
 @app.route("/")
 def home():
-    return render_template_string(WEB_PAGE, product_name=PRODUCT_NAME)
+    return render_template_string(
+        WEB_PAGE,
+        product_name=PRODUCT_NAME,
+        video_duration=VIDEO_DURATION_SECONDS,
+        target_mobile=TARGET_MOBILE,
+    )
 
 
 @app.route("/trigger-alert", methods=["GET"])
 def trigger_alert():
     button_id = request.args.get("button", "unknown")
+    try:
+        duration_seconds = max(1, min(300, int(request.args.get("duration", VIDEO_DURATION_SECONDS))))
+    except (TypeError, ValueError):
+        duration_seconds = VIDEO_DURATION_SECONDS
+    recipient = request.args.get("recipient", TARGET_MOBILE).strip() or TARGET_MOBILE
 
     categories = {"1": "Hazard", "2": "Security", "3": "Medical Concern"}
     category_name = categories.get(button_id, "General Emergency")
     current_time = datetime.now().strftime("%B %d, %Y - %I:%M %p")
+    video_filename = os.path.abspath(
+        f"evidence_btn{button_id}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.mp4"
+    )
+    with frame_lock:
+        video_available = current_frame is not None
 
     threading.Thread(
         target=record_and_upload,
-        args=(button_id,),
+        args=(button_id, video_filename, duration_seconds),
         daemon=True,
     ).start()
 
@@ -330,12 +446,13 @@ def trigger_alert():
         f"Location: STEM Department Building – STEM 12 Newton Room\n"
         f"Time: {current_time}\n\n"
         f"An emergency alert has been activated. Please proceed to the indicated location immediately and assess the situation. Visual incident documentation will be transmitted for review.\n\n"
+        f"Video: {video_url(video_filename, video_available)}\n\n"
         f"— {PRODUCT_NAME} Emergency Alert System"
     )
 
     if SEND_SMS:
         payload = {
-            "recipient": TARGET_MOBILE,
+            "recipient": recipient,
             "sender_id": SENDER_ID,
             "type": "plain",
             "message": sms_text,
