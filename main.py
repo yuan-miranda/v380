@@ -1,10 +1,11 @@
 import cv2
+import json
 import shutil
 import subprocess
 import threading
 import tempfile
 import time
-from flask import Flask, request, render_template_string
+from flask import Flask, jsonify, request, render_template_string
 from datetime import datetime
 import os
 import requests
@@ -28,6 +29,23 @@ def load_env_file(filename=".env"):
 
 load_env_file()
 
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+
+
+def load_config_file():
+    if not os.path.isfile(CONFIG_PATH):
+        return {}
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as config_file:
+            settings = json.load(config_file)
+        return settings if isinstance(settings, dict) else {}
+    except (OSError, json.JSONDecodeError) as error:
+        print(f"Configuration file could not be loaded: {error}")
+        return {}
+
+
+FILE_CONFIG = load_config_file()
+
 current_frame = None
 stream_available = False
 frame_lock = threading.Lock()
@@ -40,15 +58,23 @@ VPS_TOKEN = os.getenv("VPS_TOKEN", "")
 VIDEO_URL_BASE = os.getenv("VIDEO_URL_BASE", "")
 VIDEO_URL_TOKEN = os.getenv("VIDEO_URL_TOKEN", "")
 VIDEO_PLACEHOLDER_URL = os.getenv("VIDEO_PLACEHOLDER_URL", "")
-VIDEO_DURATION_SECONDS = int(os.getenv("VIDEO_DURATION_SECONDS", "60"))
+VIDEO_DURATION_SECONDS = int(
+    FILE_CONFIG.get("VIDEO_DURATION_SECONDS", os.getenv("VIDEO_DURATION_SECONDS", "60"))
+)
 
 # PhilSMS Configuration
 PHILSMS_URL = os.getenv("PHILSMS_URL", "https://dashboard.philsms.com/api/v3/sms/send")
 PHILSMS_TOKEN = os.getenv("PHILSMS_TOKEN", "")
-TARGET_MOBILE = os.getenv("TARGET_MOBILE", "")
+TARGET_MOBILE = FILE_CONFIG.get("TARGET_MOBILE", os.getenv("TARGET_MOBILE", ""))
 SENDER_ID = os.getenv("SENDER_ID", "PhilSMS")
 PRODUCT_NAME = os.getenv("PRODUCT_NAME", "Alerto")
 SEND_SMS = os.getenv("SEND_SMS", "false").lower() in {"1", "true", "yes", "on"}
+
+
+def save_config_file(settings):
+    with open(CONFIG_PATH, "w", encoding="utf-8") as config_file:
+        json.dump(settings, config_file, indent=2)
+        config_file.write("\n")
 
 
 def open_video_source():
@@ -362,10 +388,24 @@ WEB_PAGE = """
 
         function saveConfiguration(event) {
             event.preventDefault();
-            alertConfiguration.duration = Number(document.getElementById("duration").value);
-            alertConfiguration.recipient = document.getElementById("recipient").value.trim();
-            document.getElementById("configuration").classList.remove("open");
-            addLog("Configuration saved: " + alertConfiguration.duration + " second video; recipient " + alertConfiguration.recipient + ".", "success");
+            const duration = Number(document.getElementById("duration").value);
+            const recipient = document.getElementById("recipient").value.trim();
+            fetch("/configuration", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ duration: duration, recipient: recipient })
+            })
+                .then(response => {
+                    if (!response.ok) throw new Error("Server returned HTTP " + response.status);
+                    return response.json();
+                })
+                .then(() => {
+                    alertConfiguration.duration = duration;
+                    alertConfiguration.recipient = recipient;
+                    document.getElementById("configuration").classList.remove("open");
+                    addLog("Configuration saved to Flask: " + duration + " second video; recipient " + recipient + ".", "success");
+                })
+                .catch(error => addLog("Configuration was not saved: " + error.message, "error"));
         }
 
         function clearLog() {
@@ -423,6 +463,29 @@ def home():
         video_duration=VIDEO_DURATION_SECONDS,
         target_mobile=TARGET_MOBILE,
     )
+
+
+@app.route("/configuration", methods=["POST"])
+def save_configuration():
+    global VIDEO_DURATION_SECONDS, TARGET_MOBILE
+
+    settings = request.get_json(silent=True) or {}
+    try:
+        duration_seconds = max(1, min(300, int(settings.get("duration", VIDEO_DURATION_SECONDS))))
+    except (TypeError, ValueError):
+        return jsonify(error="Video duration must be a number from 1 to 300"), 400
+
+    recipient = str(settings.get("recipient", TARGET_MOBILE)).strip()
+    if not recipient:
+        return jsonify(error="SMS recipient is required"), 400
+
+    VIDEO_DURATION_SECONDS = duration_seconds
+    TARGET_MOBILE = recipient
+    save_config_file({
+        "VIDEO_DURATION_SECONDS": duration_seconds,
+        "TARGET_MOBILE": recipient,
+    })
+    return jsonify(message="Configuration saved"), 200
 
 
 @app.route("/trigger-alert", methods=["GET"])
