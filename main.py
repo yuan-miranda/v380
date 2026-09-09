@@ -73,6 +73,27 @@ def save_config_file(settings):
         config_file.write("\n")
 
 
+def recipient_list(value):
+    values = str(value).replace(";", ",").replace("\n", ",").split(",")
+    return [normalize_recipient(recipient) for recipient in values if normalize_recipient(recipient)]
+
+
+def normalize_recipient(value):
+    digits = "".join(character for character in str(value).strip() if character.isdigit())
+    if digits.startswith("09") and len(digits) == 11:
+        return "63" + digits[1:]
+    if digits.startswith("9") and len(digits) == 10:
+        return "63" + digits
+    if digits.startswith("63") and len(digits) == 12:
+        return digits
+    return ""
+
+
+def display_recipient(value):
+    normalized = normalize_recipient(value)
+    return "0" + normalized[2:] if normalized else ""
+
+
 def poll_vps_events():
     if not VPS_EVENT_ENDPOINT:
         return
@@ -223,6 +244,8 @@ WEB_PAGE = """
         .configuration.open { display: block; }
         .configuration label { display: block; margin-bottom: 5px; color: #334155; font-size: 12px; font-weight: 700; }
         .configuration input { width: 100%; margin-bottom: 12px; padding: 9px 10px; border: 1px solid #cbd5e1; color: #1e293b; font: inherit; }
+        .recipient-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-bottom: 12px; }
+        .recipient-grid input { margin-bottom: 0; min-width: 0; }
         .config-save { height: auto; width: auto; padding: 9px 12px; background: #0f766e; font-size: 12px; }
         .location { width: 100%; max-width: 34rem; margin: 18px auto 0; color: #64748b; font-size: clamp(11px, 3.2vw, 14px); line-height: 1.4; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: center; }
         @media (min-width: 700px) {
@@ -265,8 +288,12 @@ WEB_PAGE = """
         <form class="configuration" id="configuration" onsubmit="saveConfiguration(event)">
             <label for="duration">Video duration (seconds)</label>
             <input id="duration" type="number" min="1" max="300" value="{{ video_duration }}" required>
-            <label for="recipient">SMS recipient number</label>
-            <input id="recipient" type="tel" value="{{ target_mobile }}" placeholder="639XXXXXXXXX" required>
+            <label>SMS recipients (up to 10 numbers)</label>
+            <div class="recipient-grid">
+                {% for recipient in recipient_values %}
+                <input class="recipient-slot" type="tel" inputmode="tel" autocomplete="tel" maxlength="11" value="{{ recipient }}" placeholder="09XXXXXXXXX">
+                {% endfor %}
+            </div>
             <button class="config-save" type="submit">Save configuration</button>
         </form>
 
@@ -274,9 +301,21 @@ WEB_PAGE = """
     </div>
 
     <script>
+        function formatRecipient(input) {
+            let digits = input.value.replace(/\D/g, "");
+            if (digits.startsWith("63")) digits = "0" + digits.slice(2);
+            if (digits.startsWith("9")) digits = "0" + digits;
+            input.value = digits.slice(0, 11);
+        }
+
+        document.querySelectorAll(".recipient-slot").forEach(input => {
+            input.addEventListener("input", () => formatRecipient(input));
+            input.addEventListener("blur", () => formatRecipient(input));
+        });
+
         const alertConfiguration = {
             duration: Number(document.getElementById("duration").value),
-            recipient: document.getElementById("recipient").value
+            recipient: Array.from(document.querySelectorAll(".recipient-slot")).map(input => input.value).filter(Boolean).join(",")
         };
 
         function toggleConfiguration() {
@@ -286,7 +325,10 @@ WEB_PAGE = """
         function saveConfiguration(event) {
             event.preventDefault();
             const duration = Number(document.getElementById("duration").value);
-            const recipient = document.getElementById("recipient").value.trim();
+            const recipient = Array.from(document.querySelectorAll(".recipient-slot"))
+                .map(input => input.value.trim())
+                .filter(Boolean)
+                .join(",");
             fetch("/configuration", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
@@ -358,7 +400,7 @@ def home():
         WEB_PAGE,
         product_name=PRODUCT_NAME,
         video_duration=VIDEO_DURATION_SECONDS,
-        target_mobile=TARGET_MOBILE,
+        recipient_values=([display_recipient(recipient) for recipient in recipient_list(TARGET_MOBILE)] + [""] * 10)[:10],
     )
 
 
@@ -372,9 +414,10 @@ def save_configuration():
     except (TypeError, ValueError):
         return jsonify(error="Video duration must be a number from 1 to 300"), 400
 
-    recipient = str(settings.get("recipient", TARGET_MOBILE)).strip()
-    if not recipient:
-        return jsonify(error="SMS recipient is required"), 400
+    recipients = recipient_list(settings.get("recipient", TARGET_MOBILE))
+    if not recipients:
+        return jsonify(error="At least one SMS recipient is required"), 400
+    recipient = ",".join(recipients)
 
     VIDEO_DURATION_SECONDS = duration_seconds
     TARGET_MOBILE = recipient
@@ -392,7 +435,7 @@ def trigger_alert():
         duration_seconds = max(1, min(300, int(request.args.get("duration", VIDEO_DURATION_SECONDS))))
     except (TypeError, ValueError):
         duration_seconds = VIDEO_DURATION_SECONDS
-    recipient = request.args.get("recipient", TARGET_MOBILE).strip() or TARGET_MOBILE
+    recipient = ",".join(recipient_list(request.args.get("recipient", TARGET_MOBILE)))
 
     categories = {"1": "Hazard", "2": "Security", "3": "Medical Concern"}
     category_name = categories.get(button_id, "General Emergency")
@@ -419,13 +462,6 @@ def trigger_alert():
     )
 
     if SEND_SMS:
-        payload = {
-            "recipient": recipient,
-            "sender_id": SENDER_ID,
-            "type": "plain",
-            "message": sms_text,
-        }
-
         headers = {
             "Authorization": f"Bearer {PHILSMS_TOKEN}",
             "Content-Type": "application/json",
@@ -433,9 +469,17 @@ def trigger_alert():
         }
 
         try:
-            response = requests.post(PHILSMS_URL, json=payload, headers=headers)
-            print(f"Alert Dispatched | Status: {response.status_code}")
-            return response.text, response.status_code
+            for recipient_number in recipient_list(recipient):
+                payload = {
+                    "recipient": recipient_number,
+                    "sender_id": SENDER_ID,
+                    "type": "plain",
+                    "message": sms_text,
+                }
+                response = requests.post(PHILSMS_URL, json=payload, headers=headers)
+                response.raise_for_status()
+                print(f"Alert dispatched to {recipient_number} | Status: {response.status_code}")
+            return "SMS dispatched to all recipients", 200
         except Exception as e:
             print(f"SMS Dispatch Error: {str(e)}")
             return str(e), 500
