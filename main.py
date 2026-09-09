@@ -1,5 +1,8 @@
 import cv2
+import shutil
+import subprocess
 import threading
+import tempfile
 import time
 from flask import Flask, request, render_template_string
 from datetime import datetime
@@ -28,6 +31,9 @@ load_env_file()
 current_frame = None
 frame_lock = threading.Lock()
 RTSP_URL = os.getenv("RTSP_URL", "")
+LOCAL_CAMERA_INDEX = int(os.getenv("LOCAL_CAMERA_INDEX", "0"))
+CCTV_TIMEOUT_MILLISECONDS = int(os.getenv("CCTV_TIMEOUT_MILLISECONDS", "3000"))
+FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg")
 VPS_ENDPOINT = os.getenv("VPS_ENDPOINT", "")
 VPS_TOKEN = os.getenv("VPS_TOKEN", "")
 VIDEO_DURATION_SECONDS = int(os.getenv("VIDEO_DURATION_SECONDS", "60"))
@@ -38,12 +44,44 @@ PHILSMS_TOKEN = os.getenv("PHILSMS_TOKEN", "")
 TARGET_MOBILE = os.getenv("TARGET_MOBILE", "")
 SENDER_ID = os.getenv("SENDER_ID", "PhilSMS")
 PRODUCT_NAME = os.getenv("PRODUCT_NAME", "Alerto")
+SEND_SMS = os.getenv("SEND_SMS", "false").lower() in {"1", "true", "yes", "on"}
+
+
+def open_video_source():
+    if RTSP_URL:
+        try:
+            cctv = cv2.VideoCapture(
+                RTSP_URL,
+                cv2.CAP_FFMPEG,
+                [
+                    cv2.CAP_PROP_OPEN_TIMEOUT_MSEC,
+                    CCTV_TIMEOUT_MILLISECONDS,
+                    cv2.CAP_PROP_READ_TIMEOUT_MSEC,
+                    CCTV_TIMEOUT_MILLISECONDS,
+                ],
+            )
+        except (TypeError, cv2.error):
+            cctv = cv2.VideoCapture(RTSP_URL)
+        if cctv.isOpened():
+            print("Using CCTV stream")
+            return cctv
+        cctv.release()
+
+    device_camera = cv2.VideoCapture(LOCAL_CAMERA_INDEX)
+    if device_camera.isOpened():
+        print(f"CCTV unavailable; using device camera {LOCAL_CAMERA_INDEX}")
+        return device_camera
+    device_camera.release()
+    return None
 
 
 def capture_stream():
     global current_frame
     while True:
-        cap = cv2.VideoCapture(RTSP_URL)
+        cap = open_video_source()
+        if cap is None:
+            time.sleep(2)
+            continue
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
@@ -56,50 +94,50 @@ def capture_stream():
 threading.Thread(target=capture_stream, daemon=True).start()
 
 
-def record_and_upload(button_id):
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    filename = os.path.abspath(f"evidence_btn{button_id}_{timestamp}.mp4")
-    cap = cv2.VideoCapture(RTSP_URL)
-    writer = None
+def record_cctv_stream(filename):
+    if not RTSP_URL or shutil.which(FFMPEG_PATH) is None:
+        return False
+
+    command = [
+        FFMPEG_PATH,
+        "-y",
+        "-rtsp_transport",
+        "tcp",
+        "-i",
+        RTSP_URL,
+        "-t",
+        str(VIDEO_DURATION_SECONDS),
+        "-map",
+        "0",
+        "-c",
+        "copy",
+        "-movflags",
+        "+faststart",
+        filename,
+    ]
 
     try:
-        if not cap.isOpened():
-            raise RuntimeError("Could not open the RTSP stream")
-
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        if not fps or fps <= 0 or fps > 120:
-            fps = 20.0
-
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        if width <= 0 or height <= 0:
-            raise RuntimeError("Could not determine the video dimensions")
-
-        writer = cv2.VideoWriter(
-            filename,
-            cv2.VideoWriter_fourcc(*"mp4v"),
-            fps,
-            (width, height),
+        result = subprocess.run(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=VIDEO_DURATION_SECONDS + 15,
+            check=False,
+            text=True,
         )
-        if not writer.isOpened():
-            raise RuntimeError("Could not create the video file")
+        if result.returncode == 0 and os.path.getsize(filename) > 0:
+            print("Recorded CCTV stream directly with FFmpeg")
+            return True
+        print(f"Direct CCTV recording failed: {result.stderr[-500:]}")
+    except (OSError, subprocess.TimeoutExpired) as error:
+        print(f"Direct CCTV recording unavailable: {error}")
 
-        deadline = time.monotonic() + VIDEO_DURATION_SECONDS
-        while time.monotonic() < deadline:
-            ret, frame = cap.read()
-            if not ret:
-                raise RuntimeError("Lost the RTSP stream while recording")
-            writer.write(frame)
-    except Exception as error:
-        print(f"Video recording error: {error}")
-        if os.path.exists(filename):
-            os.remove(filename)
-        return
-    finally:
-        cap.release()
-        if writer is not None:
-            writer.release()
+    if os.path.exists(filename):
+        os.remove(filename)
+    return False
 
+
+def upload_video_file(filename):
     if not VPS_ENDPOINT:
         print(f"Video saved locally: {filename} (VPS_ENDPOINT is not configured)")
         return
@@ -117,6 +155,84 @@ def record_and_upload(button_id):
         print(f"Video uploaded: {filename} | Status: {response.status_code}")
     except Exception as error:
         print(f"Video upload error: {error}")
+
+
+def record_and_upload(button_id):
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    filename = os.path.abspath(f"evidence_btn{button_id}_{timestamp}.mp4")
+
+    if record_cctv_stream(filename):
+        upload_video_file(filename)
+        return
+
+    recording_error = None
+    snapshot_dir = None
+
+    try:
+        with frame_lock:
+            first_frame = None if current_frame is None else current_frame.copy()
+        if first_frame is None:
+            raise RuntimeError("Could not read frames from the CCTV stream or device camera")
+        height, width = first_frame.shape[:2]
+        fps = 20.0
+        if shutil.which(FFMPEG_PATH) is None:
+            raise RuntimeError("FFmpeg is required to build a video from snapshots")
+        snapshot_dir = tempfile.mkdtemp(prefix="video_frames_")
+        frame_number = 0
+
+        deadline = time.monotonic() + VIDEO_DURATION_SECONDS
+        while time.monotonic() < deadline:
+            with frame_lock:
+                frame = None if current_frame is None else current_frame.copy()
+            if frame is None:
+                time.sleep(0.05)
+                continue
+            time.sleep(1 / fps)
+            frame_path = os.path.join(snapshot_dir, f"frame_{frame_number:06d}.jpg")
+            if not cv2.imwrite(frame_path, frame):
+                raise RuntimeError("Could not save a camera snapshot")
+            frame_number += 1
+    except Exception as error:
+        recording_error = error
+
+    if recording_error is None:
+        encode_result = subprocess.run(
+            [
+                FFMPEG_PATH,
+                "-y",
+                "-framerate",
+                str(fps),
+                "-i",
+                os.path.join(snapshot_dir, "frame_%06d.jpg"),
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                filename,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            check=False,
+            text=True,
+        )
+        if encode_result.returncode != 0:
+            recording_error = RuntimeError("FFmpeg could not assemble the camera snapshots")
+
+    if snapshot_dir is not None:
+        shutil.rmtree(snapshot_dir, ignore_errors=True)
+
+    if recording_error is not None:
+        print(f"Video recording error: {recording_error}")
+        if os.path.exists(filename):
+            try:
+                os.remove(filename)
+            except OSError as error:
+                print(f"Could not remove incomplete video: {error}")
+        return
+
+    upload_video_file(filename)
 
 # Modern, Professional Mobile-Centric UI Template
 WEB_PAGE = """
@@ -217,26 +333,30 @@ def trigger_alert():
         f"— {PRODUCT_NAME} Emergency Alert System"
     )
 
-    payload = {
-        "recipient": TARGET_MOBILE,
-        "sender_id": SENDER_ID,
-        "type": "plain",
-        "message": sms_text,
-    }
+    if SEND_SMS:
+        payload = {
+            "recipient": TARGET_MOBILE,
+            "sender_id": SENDER_ID,
+            "type": "plain",
+            "message": sms_text,
+        }
 
-    headers = {
-        "Authorization": f"Bearer {PHILSMS_TOKEN}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
+        headers = {
+            "Authorization": f"Bearer {PHILSMS_TOKEN}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
 
-    try:
-        response = requests.post(PHILSMS_URL, json=payload, headers=headers)
-        print(f"Alert Dispatched | Status: {response.status_code}")
-        return response.text, response.status_code
-    except Exception as e:
-        print(f"SMS Dispatch Error: {str(e)}")
-        return str(e), 500
+        try:
+            response = requests.post(PHILSMS_URL, json=payload, headers=headers)
+            print(f"Alert Dispatched | Status: {response.status_code}")
+            return response.text, response.status_code
+        except Exception as e:
+            print(f"SMS Dispatch Error: {str(e)}")
+            return str(e), 500
+
+    print("SMS disabled; video capture/upload continues")
+    return "Alert processed without SMS", 200
 
 
 if __name__ == "__main__":
