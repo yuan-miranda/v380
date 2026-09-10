@@ -1,12 +1,21 @@
 import json
 import shutil
+import socket
+import struct
 import subprocess
 import threading
 import time
-from flask import Flask, jsonify, request, render_template_string
+import zlib
+from flask import Flask, jsonify, request, render_template_string, Response
 from datetime import datetime
 import os
 import requests
+
+try:
+    from zeroconf import ServiceInfo, Zeroconf
+except ImportError:
+    ServiceInfo = None
+    Zeroconf = None
 
 app = Flask(__name__)
 
@@ -63,8 +72,12 @@ PHILSMS_URL = os.getenv("PHILSMS_URL", "https://dashboard.philsms.com/api/v3/sms
 PHILSMS_TOKEN = os.getenv("PHILSMS_TOKEN", "")
 TARGET_MOBILE = FILE_CONFIG.get("TARGET_MOBILE", os.getenv("TARGET_MOBILE", ""))
 SENDER_ID = os.getenv("SENDER_ID", "PhilSMS")
-PRODUCT_NAME = os.getenv("PRODUCT_NAME", "Alerto")
+PRODUCT_NAME = os.getenv("PRODUCT_NAME", "ALERTO").upper()
 SEND_SMS = os.getenv("SEND_SMS", "false").lower() in {"1", "true", "yes", "on"}
+
+# mDNS / PWA configuration
+MDNS_NAME = os.getenv("MDNS_NAME", "alerto")  # accessible as http://alerto.local:5000
+APP_PORT = int(os.getenv("APP_PORT", "5000"))
 
 
 def save_config_file(settings):
@@ -119,6 +132,60 @@ def poll_vps_events():
 
 
 threading.Thread(target=poll_vps_events, daemon=True).start()
+
+
+def get_local_ip():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect(("8.8.8.8", 80))
+        return sock.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        sock.close()
+
+
+def start_mdns():
+    """Broadcast this Flask app on the LAN as http://<MDNS_NAME>.local:<APP_PORT>."""
+    if Zeroconf is None:
+        print("zeroconf not installed; skipping mDNS. Run: pip install zeroconf")
+        return None
+
+    ip = get_local_ip()
+    info = ServiceInfo(
+        "_http._tcp.local.",
+        f"{MDNS_NAME}._http._tcp.local.",
+        addresses=[socket.inet_aton(ip)],
+        port=APP_PORT,
+        properties={},
+        server=f"{MDNS_NAME}.local.",
+    )
+    zeroconf = Zeroconf()
+    zeroconf.register_service(info)
+    print(f"mDNS broadcasting: http://{MDNS_NAME}.local:{APP_PORT}  (current IP: {ip})")
+    return zeroconf
+
+
+def _solid_color_png(size, rgb):
+    """Build a minimal valid solid-color PNG without any image library dependency."""
+    def chunk(tag, data):
+        return (
+            struct.pack(">I", len(data))
+            + tag
+            + data
+            + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+        )
+
+    r, g, b = rgb
+    row = b"\x00" + bytes([r, g, b]) * size
+    raw = row * size
+    compressed = zlib.compress(raw, 9)
+
+    png = b"\x89PNG\r\n\x1a\n"
+    png += chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0))
+    png += chunk(b"IDAT", compressed)
+    png += chunk(b"IEND", b"")
+    return png
 
 
 def record_cctv_stream(filename, duration_seconds):
@@ -208,6 +275,12 @@ WEB_PAGE = """
 <head>
     <title>Alerto Emergency Alert System</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="manifest" href="/manifest.json">
+    <meta name="theme-color" content="#b91c1c">
+    <link rel="apple-touch-icon" href="/icon-192.png">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="mobile-web-app-capable" content="yes">
     <style>
         :root { color-scheme: light; }
         * { box-sizing: border-box; }
@@ -301,6 +374,12 @@ WEB_PAGE = """
     </div>
 
     <script>
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', () => {
+                navigator.serviceWorker.register('/sw.js').catch(err => console.error('SW registration failed:', err));
+            });
+        }
+
         function formatRecipient(input) {
             let digits = input.value.replace(/\D/g, "");
             if (digits.startsWith("63")) digits = "0" + digits.slice(2);
@@ -392,6 +471,42 @@ WEB_PAGE = """
 </body>
 </html>
 """
+
+
+@app.route("/manifest.json")
+def manifest():
+    return jsonify({
+        "name": f"{PRODUCT_NAME} Emergency Alert System",
+        "short_name": PRODUCT_NAME,
+        "start_url": "/",
+        "display": "standalone",
+        "background_color": "#f8fafc",
+        "theme_color": "#b91c1c",
+        "icons": [
+            {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png"},
+            {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png"},
+        ],
+    })
+
+
+@app.route("/icon-<int:size>.png")
+def icon(size):
+    if size not in (192, 512):
+        return "Not found", 404
+    png_bytes = _solid_color_png(size, (185, 28, 28))  # matches btn-security crimson
+    return Response(png_bytes, mimetype="image/png")
+
+
+@app.route("/sw.js")
+def service_worker():
+    # Minimal service worker: required for installability, but deliberately does NOT
+    # cache anything, so the emergency dashboard never shows stale content offline.
+    sw_code = """
+    self.addEventListener('install', (event) => { self.skipWaiting(); });
+    self.addEventListener('activate', (event) => { event.waitUntil(self.clients.claim()); });
+    self.addEventListener('fetch', (event) => { event.respondWith(fetch(event.request)); });
+    """
+    return Response(sw_code, mimetype="application/javascript")
 
 
 @app.route("/")
@@ -489,4 +604,9 @@ def trigger_alert():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    _zeroconf = start_mdns()
+    try:
+        app.run(host="0.0.0.0", port=APP_PORT, debug=False)
+    finally:
+        if _zeroconf:
+            _zeroconf.close()
