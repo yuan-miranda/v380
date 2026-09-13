@@ -1,12 +1,22 @@
 import os
 import json
+import logging
+import struct
 import threading
 from datetime import datetime
 from pathlib import Path
+import zlib
 
 import requests
-from flask import Flask, abort, jsonify, render_template_string, request, send_from_directory
+from flask import Flask, Response, abort, jsonify, render_template_string, request, send_from_directory
 from werkzeug.utils import secure_filename
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+logger = logging.getLogger("alerto.server")
 
 app = Flask(__name__)
 
@@ -40,6 +50,7 @@ SENDER_ID = os.getenv("SENDER_ID", "PhilSMS")
 SEND_SMS = os.getenv("SEND_SMS", "false").lower() in {"1", "true", "yes", "on"}
 TARGET_MOBILE = os.getenv("TARGET_MOBILE", "")
 VIDEO_DURATION_SECONDS = int(os.getenv("VIDEO_DURATION_SECONDS", "60"))
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://178.128.82.49:5000")
 CONFIG_PATH = Path(__file__).resolve().with_name("config.json")
 pending_events = []
 events_lock = threading.Lock()
@@ -59,7 +70,24 @@ def has_view_token():
 
 
 def recipient_list(value):
-    return [item.strip() for item in str(value).replace(";", ",").split(",") if item.strip()]
+    values = str(value).replace(";", ",").replace("\n", ",").split(",")
+    return [normalize_recipient(item) for item in values if normalize_recipient(item)]
+
+
+def normalize_recipient(value):
+    digits = "".join(character for character in str(value).strip() if character.isdigit())
+    if digits.startswith("09") and len(digits) == 11:
+        return "63" + digits[1:]
+    if digits.startswith("9") and len(digits) == 10:
+        return "63" + digits
+    if digits.startswith("63") and len(digits) == 12:
+        return digits
+    return ""
+
+
+def display_recipient(value):
+    normalized = normalize_recipient(value)
+    return "0" + normalized[2:] if normalized else ""
 
 
 WEB_PAGE = """
@@ -70,6 +98,8 @@ WEB_PAGE = """
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <link rel="manifest" href="/manifest.json">
     <meta name="theme-color" content="#b91c1c">
+    <link rel="apple-touch-icon" href="/icon-192.png">
+    <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="mobile-web-app-capable" content="yes">
     <style>
         :root { color-scheme: light; }
@@ -107,6 +137,7 @@ WEB_PAGE = """
     <div class="location">STEM Department Building &bull; STEM 12 Newton Room</div>
 </div>
 <script>
+if ('serviceWorker' in navigator) { window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js')); }
 function formatRecipient(input) { let digits = input.value.replace(/\D/g, ""); if (digits.startsWith("63")) digits = "0" + digits.slice(2); if (digits.startsWith("9")) digits = "0" + digits; input.value = digits.slice(0, 11); }
 document.querySelectorAll(".recipient-slot").forEach(input => { input.addEventListener("input", () => formatRecipient(input)); input.addEventListener("blur", () => formatRecipient(input)); });
 const alertConfiguration = { duration: Number(document.getElementById("duration").value), recipient: Array.from(document.querySelectorAll(".recipient-slot")).map(input => input.value).filter(Boolean).join(",") };
@@ -132,7 +163,7 @@ def home():
         WEB_PAGE,
         product_name=PRODUCT_NAME,
         duration=saved.get("VIDEO_DURATION_SECONDS", VIDEO_DURATION_SECONDS),
-        recipient_values=(recipients + [""] * 10)[:10],
+        recipient_values=([display_recipient(recipient) for recipient in recipients] + [""] * 10)[:10],
     )
 
 
@@ -145,12 +176,36 @@ def manifest():
         "display": "standalone",
         "background_color": "#f8fafc",
         "theme_color": "#b91c1c",
+        "icons": [
+            {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png"},
+            {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png"},
+        ],
     })
+
+
+@app.get("/icon-<int:size>.png")
+def icon(size):
+    if size not in (192, 512):
+        return "Not found", 404
+
+    def chunk(tag, data):
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+    row = b"\x00" + bytes((185, 28, 28)) * size
+    png = b"\x89PNG\r\n\x1a\n"
+    png += chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0))
+    png += chunk(b"IDAT", zlib.compress(row * size, 9))
+    return Response(png + chunk(b"IEND", b""), mimetype="image/png")
 
 
 @app.get("/sw.js")
 def service_worker():
-    return "self.addEventListener('install', event => self.skipWaiting());", 200, {"Content-Type": "application/javascript"}
+    sw_code = """
+    self.addEventListener('install', event => self.skipWaiting());
+    self.addEventListener('activate', event => event.waitUntil(self.clients.claim()));
+    self.addEventListener('fetch', event => event.respondWith(fetch(event.request)));
+    """
+    return Response(sw_code, mimetype="application/javascript")
 
 
 @app.post("/events")
@@ -166,6 +221,8 @@ def create_event():
     duration = max(1, min(300, int(data.get("duration", VIDEO_DURATION_SECONDS))))
     with events_lock:
         pending_events.append({"button": button_id, "duration": duration})
+        queue_size = len(pending_events)
+    logger.info("ESP32 event queued: button=%s duration=%ss queue_size=%s", button_id, duration, queue_size)
     return jsonify(message="Event queued"), 202
 
 
@@ -187,6 +244,7 @@ def save_configuration():
         json.dumps({"VIDEO_DURATION_SECONDS": duration, "TARGET_MOBILE": TARGET_MOBILE}, indent=2),
         encoding="utf-8",
     )
+    logger.info("Configuration saved: duration=%ss recipients=%s", duration, recipients)
     return jsonify(message="Configuration saved"), 200
 
 
@@ -199,21 +257,34 @@ def trigger_alert():
     duration = max(1, min(300, int(request.args.get("duration", VIDEO_DURATION_SECONDS))))
     with events_lock:
         pending_events.append({"button": button_id, "duration": duration})
+        queue_size = len(pending_events)
+    recipients = recipient_list(TARGET_MOBILE)
+    logger.info("Website alert queued: button=%s duration=%ss queue_size=%s recipients=%s", button_id, duration, queue_size, recipients)
 
     if SEND_SMS and PHILSMS_URL and PHILSMS_TOKEN:
         category = {"1": "Hazard", "2": "Security", "3": "Medical Concern"}[button_id]
         message = (
-            f"{PRODUCT_NAME} EMERGENCY ALERT\n\nCategory: {category}\n"
-            f"Location: STEM Department Building - STEM 12 Newton Room\n"
+            f"{PRODUCT_NAME} EMERGENCY ALERT\n\n"
+            f"Category: {category}\n"
+            "Location: STEM Department Building - STEM 12 Newton Room\n"
             f"Time: {datetime.now().strftime('%B %d, %Y - %I:%M %p')}\n\n"
-            "Evidence recording has been queued."
+            "An emergency alert has been activated. Please proceed to the indicated "
+            "location immediately and assess the situation. Visual incident "
+            "documentation will be transmitted for review.\n\n"
+            f"Video: {PUBLIC_BASE_URL.rstrip('/')}/videos?token={VIEW_TOKEN}\n\n"
+            f"- {PRODUCT_NAME} Emergency Alert System"
         )
         headers = {"Authorization": f"Bearer {PHILSMS_TOKEN}", "Content-Type": "application/json"}
-        for recipient in recipient_list(TARGET_MOBILE):
+        for recipient in recipients:
             try:
                 requests.post(PHILSMS_URL, json={"recipient": recipient, "sender_id": SENDER_ID, "type": "plain", "message": message}, headers=headers, timeout=20).raise_for_status()
+                logger.info("SMS sent: recipient=%s button=%s", recipient, button_id)
             except requests.RequestException as error:
-                print(f"SMS dispatch error for {recipient}: {error}")
+                logger.error("SMS failed: recipient=%s error=%s", recipient, error)
+    elif not SEND_SMS:
+        logger.info("SMS disabled: recipients=%s", recipients)
+    else:
+        logger.warning("SMS not sent: PHILSMS_URL or PHILSMS_TOKEN is missing")
 
     return "Alert queued; the phone worker will record and upload the video.", 202
 
@@ -227,6 +298,8 @@ def next_event():
         if not pending_events:
             return jsonify(event=None), 200
         event = pending_events.pop(0)
+        queue_size = len(pending_events)
+    logger.info("Event delivered to phone worker: event=%s queue_size=%s", event, queue_size)
     return jsonify(event=event), 200
 
 
@@ -244,6 +317,7 @@ def upload_video():
         return jsonify(error="Only MP4 files are accepted"), 400
 
     video.save(UPLOAD_DIR / filename)
+    logger.info("Video uploaded: file=%s size=%d bytes", filename, (UPLOAD_DIR / filename).stat().st_size)
     return jsonify(message="Upload successful", filename=filename), 201
 
 

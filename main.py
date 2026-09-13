@@ -1,10 +1,18 @@
 import os
+import logging
 import shutil
 import subprocess
 import time
 from datetime import datetime
 
 import requests
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+logger = logging.getLogger("alerto.worker")
 
 
 def load_env_file(filename=".env"):
@@ -33,9 +41,10 @@ VIDEO_DURATION_SECONDS = int(os.getenv("VIDEO_DURATION_SECONDS", "60"))
 
 def record_cctv_stream(filename, duration_seconds):
     if not RTSP_URL or shutil.which(FFMPEG_PATH) is None:
-        print("Video recording error: RTSP_URL or FFmpeg is unavailable")
+        logger.error("Recording skipped: RTSP_URL or FFmpeg is unavailable")
         return False
 
+    logger.info("Recording started: duration=%ss output=%s", duration_seconds, filename)
     try:
         result = subprocess.run(
             [
@@ -50,13 +59,14 @@ def record_cctv_stream(filename, duration_seconds):
             text=True,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
-        print(f"Video recording error: {error}")
+        logger.error("Recording failed: %s", error)
         return False
 
     if result.returncode == 0 and os.path.isfile(filename) and os.path.getsize(filename) > 0:
+        logger.info("Recording complete: file=%s size=%d bytes", filename, os.path.getsize(filename))
         return True
 
-    print(f"Video recording error: {result.stderr[-500:]}")
+    logger.error("FFmpeg recording failed: %s", result.stderr[-500:].strip())
     if os.path.exists(filename):
         os.remove(filename)
     return False
@@ -64,7 +74,9 @@ def record_cctv_stream(filename, duration_seconds):
 
 def upload_video(filename):
     if not VPS_ENDPOINT or not os.path.isfile(filename):
+        logger.warning("Upload skipped: endpoint or video file is unavailable: %s", filename)
         return
+    logger.info("Upload started: file=%s endpoint=%s", filename, VPS_ENDPOINT)
     try:
         with open(filename, "rb") as video_file:
             response = requests.post(
@@ -74,9 +86,9 @@ def upload_video(filename):
                 timeout=120,
             )
         response.raise_for_status()
-        print(f"Video uploaded: {filename} | Status: {response.status_code}")
+        logger.info("Upload complete: file=%s status=%s", filename, response.status_code)
     except requests.RequestException as error:
-        print(f"Video upload error: {error}")
+        logger.error("Upload failed: %s", error)
 
 
 def process_event(event):
@@ -88,15 +100,19 @@ def process_event(event):
     filename = os.path.abspath(
         f"evidence_btn{button_id}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.mp4"
     )
+    logger.info("Event received: button=%s duration=%ss", button_id, duration)
     if record_cctv_stream(filename, duration):
         upload_video(filename)
+    else:
+        logger.error("Event failed before upload: button=%s", button_id)
 
 
 def poll_events():
     if not VPS_EVENT_ENDPOINT:
-        print("VPS_EVENT_ENDPOINT is not configured")
+        logger.error("VPS_EVENT_ENDPOINT is not configured")
         return
 
+    logger.info("Worker polling: endpoint=%s interval=%ss", VPS_EVENT_ENDPOINT, POLL_INTERVAL_SECONDS)
     headers = {"Authorization": f"Bearer {VPS_EVENT_TOKEN}"}
     while True:
         try:
@@ -106,10 +122,10 @@ def poll_events():
             if event:
                 process_event(event)
         except (requests.RequestException, ValueError, TypeError) as error:
-            print(f"VPS event polling error: {error}")
+            logger.error("Event polling failed: %s", error)
         time.sleep(POLL_INTERVAL_SECONDS)
 
 
 if __name__ == "__main__":
-    print("ALERTO video worker started")
+    logger.info("ALERTO video worker started")
     poll_events()
