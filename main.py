@@ -1,57 +1,25 @@
-import json
-import shutil
-import socket
-import struct
-import subprocess
-import threading
-import time
-import zlib
-from flask import Flask, jsonify, request, render_template_string, Response
-from datetime import datetime
 import os
+import shutil
+import subprocess
+import time
+from datetime import datetime
+
 import requests
-
-try:
-    from zeroconf import ServiceInfo, Zeroconf
-except ImportError:
-    ServiceInfo = None
-    Zeroconf = None
-
-app = Flask(__name__)
 
 
 def load_env_file(filename=".env"):
     if not os.path.exists(filename):
         return
-
     with open(filename, encoding="utf-8") as env_file:
         for line in env_file:
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
             key, value = line.split("=", 1)
-            value = value.strip().strip('"').strip("'")
-            os.environ.setdefault(key.strip(), value)
+            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
 
 load_env_file()
-
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
-
-
-def load_config_file():
-    if not os.path.isfile(CONFIG_PATH):
-        return {}
-    try:
-        with open(CONFIG_PATH, encoding="utf-8") as config_file:
-            settings = json.load(config_file)
-        return settings if isinstance(settings, dict) else {}
-    except (OSError, json.JSONDecodeError) as error:
-        print(f"Configuration file could not be loaded: {error}")
-        return {}
-
-
-FILE_CONFIG = load_config_file()
 
 RTSP_URL = os.getenv("RTSP_URL", "")
 FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg")
@@ -60,577 +28,88 @@ VPS_TOKEN = os.getenv("VPS_TOKEN", "")
 VPS_EVENT_ENDPOINT = os.getenv("VPS_EVENT_ENDPOINT", "")
 VPS_EVENT_TOKEN = os.getenv("VPS_EVENT_TOKEN", VPS_TOKEN)
 POLL_INTERVAL_SECONDS = float(os.getenv("POLL_INTERVAL_SECONDS", "2"))
-VIDEO_URL_BASE = os.getenv("VIDEO_URL_BASE", "")
-VIDEO_URL_TOKEN = os.getenv("VIDEO_URL_TOKEN", "")
-VIDEO_PLACEHOLDER_URL = os.getenv("VIDEO_PLACEHOLDER_URL", "")
-VIDEO_DURATION_SECONDS = int(
-    FILE_CONFIG.get("VIDEO_DURATION_SECONDS", os.getenv("VIDEO_DURATION_SECONDS", "60"))
-)
-
-# PhilSMS Configuration
-PHILSMS_URL = os.getenv("PHILSMS_URL", "https://dashboard.philsms.com/api/v3/sms/send")
-PHILSMS_TOKEN = os.getenv("PHILSMS_TOKEN", "")
-TARGET_MOBILE = FILE_CONFIG.get("TARGET_MOBILE", os.getenv("TARGET_MOBILE", ""))
-SENDER_ID = os.getenv("SENDER_ID", "PhilSMS")
-PRODUCT_NAME = os.getenv("PRODUCT_NAME", "ALERTO").upper()
-SEND_SMS = os.getenv("SEND_SMS", "false").lower() in {"1", "true", "yes", "on"}
-
-# mDNS / PWA configuration
-MDNS_NAME = os.getenv("MDNS_NAME", "alerto")  # accessible as http://alerto.local:5000
-APP_PORT = int(os.getenv("APP_PORT", "5000"))
-
-
-def save_config_file(settings):
-    with open(CONFIG_PATH, "w", encoding="utf-8") as config_file:
-        json.dump(settings, config_file, indent=2)
-        config_file.write("\n")
-
-
-def recipient_list(value):
-    values = str(value).replace(";", ",").replace("\n", ",").split(",")
-    return [
-        normalize_recipient(recipient)
-        for recipient in values
-        if normalize_recipient(recipient)
-    ]
-
-
-def normalize_recipient(value):
-    digits = "".join(
-        character for character in str(value).strip() if character.isdigit()
-    )
-    if digits.startswith("09") and len(digits) == 11:
-        return "63" + digits[1:]
-    if digits.startswith("9") and len(digits) == 10:
-        return "63" + digits
-    if digits.startswith("63") and len(digits) == 12:
-        return digits
-    return ""
-
-
-def display_recipient(value):
-    normalized = normalize_recipient(value)
-    return "0" + normalized[2:] if normalized else ""
-
-
-def poll_vps_events():
-    if not VPS_EVENT_ENDPOINT:
-        return
-
-    headers = {"Authorization": f"Bearer {VPS_EVENT_TOKEN}"}
-    local_trigger_url = "http://127.0.0.1:5000/trigger-alert"
-    while True:
-        try:
-            response = requests.get(VPS_EVENT_ENDPOINT, headers=headers, timeout=10)
-            response.raise_for_status()
-            event = response.json().get("event")
-            if event:
-                button_id = str(event.get("button", ""))
-                if button_id in {"1", "2", "3"}:
-                    requests.get(
-                        local_trigger_url,
-                        params={"button": button_id},
-                        timeout=10,
-                    )
-        except (requests.RequestException, ValueError) as error:
-            print(f"VPS event polling error: {error}")
-        time.sleep(POLL_INTERVAL_SECONDS)
-
-
-threading.Thread(target=poll_vps_events, daemon=True).start()
-
-
-def get_local_ip():
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        sock.connect(("8.8.8.8", 80))
-        return sock.getsockname()[0]
-    except OSError:
-        return "127.0.0.1"
-    finally:
-        sock.close()
-
-
-def start_mdns():
-    """Broadcast this Flask app on the LAN as http://<MDNS_NAME>.local:<APP_PORT>."""
-    if Zeroconf is None:
-        print("zeroconf not installed; skipping mDNS. Run: pip install zeroconf")
-        return None
-
-    ip = get_local_ip()
-    info = ServiceInfo(
-        "_http._tcp.local.",
-        f"{MDNS_NAME}._http._tcp.local.",
-        addresses=[socket.inet_aton(ip)],
-        port=APP_PORT,
-        properties={},
-        server=f"{MDNS_NAME}.local.",
-    )
-    zeroconf = Zeroconf()
-    zeroconf.register_service(info)
-    print(f"mDNS broadcasting: http://{MDNS_NAME}.local:{APP_PORT}  (current IP: {ip})")
-    return zeroconf
-
-
-def _solid_color_png(size, rgb):
-    """Build a minimal valid solid-color PNG without any image library dependency."""
-
-    def chunk(tag, data):
-        return (
-            struct.pack(">I", len(data))
-            + tag
-            + data
-            + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
-        )
-
-    r, g, b = rgb
-    row = b"\x00" + bytes([r, g, b]) * size
-    raw = row * size
-    compressed = zlib.compress(raw, 9)
-
-    png = b"\x89PNG\r\n\x1a\n"
-    png += chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0))
-    png += chunk(b"IDAT", compressed)
-    png += chunk(b"IEND", b"")
-    return png
+VIDEO_DURATION_SECONDS = int(os.getenv("VIDEO_DURATION_SECONDS", "60"))
 
 
 def record_cctv_stream(filename, duration_seconds):
     if not RTSP_URL or shutil.which(FFMPEG_PATH) is None:
+        print("Video recording error: RTSP_URL or FFmpeg is unavailable")
         return False
-
-    command = [
-        FFMPEG_PATH,
-        "-y",
-        "-rtsp_transport",
-        "tcp",
-        "-i",
-        RTSP_URL,
-        "-t",
-        str(duration_seconds),
-        "-map",
-        "0",
-        "-c",
-        "copy",
-        "-movflags",
-        "+faststart",
-        filename,
-    ]
 
     try:
         result = subprocess.run(
-            command,
+            [
+                FFMPEG_PATH, "-y", "-rtsp_transport", "tcp", "-i", RTSP_URL,
+                "-t", str(duration_seconds), "-map", "0:v:0", "-c:v", "copy",
+                "-movflags", "+faststart", filename,
+            ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
-            timeout=duration_seconds + 15,
+            timeout=duration_seconds + 30,
             check=False,
             text=True,
         )
-        if result.returncode == 0 and os.path.getsize(filename) > 0:
-            print("Recorded CCTV stream directly with FFmpeg")
-            return True
-        print(f"Direct CCTV recording failed: {result.stderr[-500:]}")
     except (OSError, subprocess.TimeoutExpired) as error:
-        print(f"Direct CCTV recording unavailable: {error}")
+        print(f"Video recording error: {error}")
+        return False
 
+    if result.returncode == 0 and os.path.isfile(filename) and os.path.getsize(filename) > 0:
+        return True
+
+    print(f"Video recording error: {result.stderr[-500:]}")
     if os.path.exists(filename):
         os.remove(filename)
     return False
 
 
-def upload_video_file(filename):
-    if not os.path.isfile(filename) or os.path.getsize(filename) == 0:
-        print(f"Skipping empty or missing video: {filename}")
+def upload_video(filename):
+    if not VPS_ENDPOINT or not os.path.isfile(filename):
         return
-
-    if not VPS_ENDPOINT:
-        print(f"Video saved locally: {filename} (VPS_ENDPOINT is not configured)")
-        return
-
-    headers = {"Authorization": f"Bearer {VPS_TOKEN}"} if VPS_TOKEN else {}
     try:
         with open(filename, "rb") as video_file:
             response = requests.post(
                 VPS_ENDPOINT,
                 files={"video": (os.path.basename(filename), video_file, "video/mp4")},
-                headers=headers,
+                headers={"Authorization": f"Bearer {VPS_TOKEN}"},
                 timeout=120,
             )
         response.raise_for_status()
         print(f"Video uploaded: {filename} | Status: {response.status_code}")
-    except Exception as error:
+    except requests.RequestException as error:
         print(f"Video upload error: {error}")
 
 
-def record_and_upload(button_id, filename, duration_seconds):
-    if record_cctv_stream(filename, duration_seconds):
-        upload_video_file(filename)
-        return
-    print("Video recording error: CCTV RTSP stream could not be recorded")
-
-
-def video_url(filename, video_available):
-    if not video_available:
-        return VIDEO_PLACEHOLDER_URL
-    token = f"?token={VIDEO_URL_TOKEN}" if VIDEO_URL_TOKEN else ""
-    return f"{VIDEO_URL_BASE.rstrip('/')}/{os.path.basename(filename)}{token}"
-
-
-# Modern, Professional Mobile-Centric UI Template
-WEB_PAGE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Alerto Emergency Alert System</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <link rel="manifest" href="/manifest.json">
-    <meta name="theme-color" content="#b91c1c">
-    <link rel="apple-touch-icon" href="/icon-192.png">
-    <meta name="apple-mobile-web-app-capable" content="yes">
-    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-    <meta name="mobile-web-app-capable" content="yes">
-    <style>
-        :root { color-scheme: light; }
-        * { box-sizing: border-box; }
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; text-align: center; margin: 0; min-height: 100dvh; background: #e2e8f0; }
-        .container { background: #f8fafc; min-height: 100dvh; width: 100%; padding: max(32px, env(safe-area-inset-top)) max(20px, env(safe-area-inset-right)) max(28px, env(safe-area-inset-bottom)) max(20px, env(safe-area-inset-left)); display: flex; flex-direction: column; justify-content: center; align-items: center; overflow: hidden; }
-        h2 { color: #0f172a; margin: 0 0 8px; font-family: Georgia, "Times New Roman", serif; font-size: clamp(28px, 7vw, 38px); font-weight: 700; letter-spacing: 0; line-height: 1.1; }
-        .subtitle { color: #64748b; margin: 0 0 30px; font-size: 14px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; }
-        p { color: #64748b; font-size: 15px; margin: 0 auto 32px; max-width: 28rem; }
-        .button-stack { display: flex; flex-direction: column; gap: 16px; width: 100%; max-width: 34rem; margin: 0 auto; }
-        button { width: 100%; height: clamp(160px, 38vw, 220px); padding: 18px; font-size: clamp(21px, 6vw, 28px); color: white; border: none; border-radius: 0; cursor: pointer; font-weight: 700; box-shadow: none; transition: transform 0.1s ease, opacity 0.2s; touch-action: manipulation; }
-        button:active { transform: scale(0.98); opacity: 0.9; }
-        
-        /* Professional, non-goofy color palette */
-        .btn-hazard { background: #d97706; }    /* Amber/Orange */
-        .btn-security { background: #b91c1c; }  /* Deep Crimson Red */
-        .btn-medical { background: #047857; }   /* Professional Emerald Green */
-        
-        .activity-log { width: 100%; max-width: 34rem; margin: 24px auto 0; border: 1px solid #cbd5e1; background: #ffffff; text-align: left; }
-        .log-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 12px 14px; border-bottom: 1px solid #e2e8f0; color: #1e293b; font-size: 13px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; }
-        .log-state { cursor: default; opacity: 1; }
-        #status { min-height: 54px; max-height: 150px; overflow-y: auto; }
-        .log-empty, .log-entry { padding: 11px 14px; font-size: 13px; line-height: 1.35; }
-        .log-empty { color: #64748b; }
-        .log-entry { display: flex; gap: 10px; border-bottom: 1px solid #f1f5f9; color: #334155; }
-        .log-entry:last-child { border-bottom: 0; }
-        .log-time { flex: 0 0 auto; color: #94a3b8; font-variant-numeric: tabular-nums; }
-        .log-entry.success .log-message { color: #047857; }
-        .log-entry.error .log-message { color: #b91c1c; }
-        .log-entry.pending .log-message { color: #b45309; }
-        .log-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
-        .log-action { height: auto; width: auto; padding: 5px 8px; background: #e2e8f0; color: #334155; font-size: 11px; font-weight: 700; }
-        .log-action:hover { background: #cbd5e1; }
-        .configuration { display: none; width: 100%; max-width: 34rem; margin: 10px auto 0; padding: 14px; border: 1px solid #cbd5e1; background: #ffffff; text-align: left; }
-        .configuration.open { display: block; }
-        .configuration label { display: block; margin-bottom: 5px; color: #334155; font-size: 12px; font-weight: 700; }
-        .configuration input { width: 100%; margin-bottom: 12px; padding: 9px 10px; border: 1px solid #cbd5e1; color: #1e293b; font: inherit; }
-        .recipient-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-bottom: 12px; }
-        .recipient-grid input { margin-bottom: 0; min-width: 0; }
-        .config-save { height: auto; width: auto; padding: 9px 12px; background: #0f766e; font-size: 12px; }
-        .location { width: 100%; max-width: 34rem; margin: 18px auto 0; color: #64748b; font-size: clamp(11px, 3.2vw, 14px); line-height: 1.4; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: center; }
-        @media (min-width: 700px) {
-            .container { padding: 48px; }
-            .button-stack { gap: 18px; }
-            button { height: 220px; }
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h2>{{ product_name }}</h2>
-        <p class="subtitle">Emergency Reporting System</p>
-        
-        <div class="button-stack">
-            <!-- Button 1: Hazard -->
-            <button class="btn-hazard" onclick="triggerAlert(1)">Hazard</button>
-            
-            <!-- Button 2: Security -->
-            <button class="btn-security" onclick="triggerAlert(2)">Security</button>
-            
-            <!-- Button 3: Medical Concern -->
-            <button class="btn-medical" onclick="triggerAlert(3)">Medical Concern</button>
-        </div>
-        
-        <section class="activity-log" aria-live="polite">
-            <div class="log-header">
-                <span>Activity log</span>
-                <div class="log-actions">
-                    <button class="log-action log-state" id="log-state" type="button" disabled>Ready</button>
-                    <button class="log-action" type="button" onclick="clearLog()">Clear log</button>
-                    <button class="log-action" type="button" onclick="toggleConfiguration()">Configuration</button>
-                </div>
-            </div>
-            <div id="status">
-                <div class="log-empty">No alerts recorded in this session.</div>
-            </div>
-        </section>
-
-        <form class="configuration" id="configuration" onsubmit="saveConfiguration(event)">
-            <label for="duration">Video duration (seconds)</label>
-            <input id="duration" type="number" min="1" max="300" value="{{ video_duration }}" required>
-            <label>SMS recipients (up to 10 numbers)</label>
-            <div class="recipient-grid">
-                {% for recipient in recipient_values %}
-                <input class="recipient-slot" type="tel" inputmode="tel" autocomplete="tel" maxlength="11" value="{{ recipient }}" placeholder="09XXXXXXXXX">
-                {% endfor %}
-            </div>
-            <button class="config-save" type="submit">Save configuration</button>
-        </form>
-
-        <div class="location">STEM Department Building &bull; STEM 12 Newton Room</div>
-    </div>
-
-    <script>
-        if ('serviceWorker' in navigator) {
-            window.addEventListener('load', () => {
-                navigator.serviceWorker.register('/sw.js').catch(err => console.error('SW registration failed:', err));
-            });
-        }
-
-        function formatRecipient(input) {
-            let digits = input.value.replace(/\D/g, "");
-            if (digits.startsWith("63")) digits = "0" + digits.slice(2);
-            if (digits.startsWith("9")) digits = "0" + digits;
-            input.value = digits.slice(0, 11);
-        }
-
-        document.querySelectorAll(".recipient-slot").forEach(input => {
-            input.addEventListener("input", () => formatRecipient(input));
-            input.addEventListener("blur", () => formatRecipient(input));
-        });
-
-        const alertConfiguration = {
-            duration: Number(document.getElementById("duration").value),
-            recipient: Array.from(document.querySelectorAll(".recipient-slot")).map(input => input.value).filter(Boolean).join(",")
-        };
-
-        function toggleConfiguration() {
-            document.getElementById("configuration").classList.toggle("open");
-        }
-
-        function saveConfiguration(event) {
-            event.preventDefault();
-            const duration = Number(document.getElementById("duration").value);
-            const recipient = Array.from(document.querySelectorAll(".recipient-slot"))
-                .map(input => input.value.trim())
-                .filter(Boolean)
-                .join(",");
-            fetch("/configuration", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ duration: duration, recipient: recipient })
-            })
-                .then(response => {
-                    if (!response.ok) throw new Error("Server returned HTTP " + response.status);
-                    return response.json();
-                })
-                .then(() => {
-                    alertConfiguration.duration = duration;
-                    alertConfiguration.recipient = recipient;
-                    document.getElementById("configuration").classList.remove("open");
-                    addLog("Configuration saved to Flask: " + duration + " second video; recipient " + recipient + ".", "success");
-                })
-                .catch(error => addLog("Configuration was not saved: " + error.message, "error"));
-        }
-
-        function clearLog() {
-            document.getElementById("status").innerHTML = '<div class="log-empty">No alerts recorded in this session.</div>';
-            document.getElementById("log-state").innerText = "Ready";
-        }
-
-        function addLog(message, level) {
-            const status = document.getElementById("status");
-            const empty = status.querySelector(".log-empty");
-            if (empty) empty.remove();
-
-            const entry = document.createElement("div");
-            entry.className = "log-entry " + level;
-            entry.innerHTML = '<span class="log-time">' + new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) + '</span>' +
-                '<span class="log-message">' + message + '</span>';
-            status.prepend(entry);
-        }
-
-        function triggerAlert(buttonId) {
-            const category = { 1: "Hazard", 2: "Security", 3: "Medical concern" }[buttonId] || "General emergency";
-            document.getElementById("log-state").innerText = "Working";
-            addLog(category + " alert queued; evidence capture started.", "pending");
-            const query = new URLSearchParams({
-                button: buttonId,
-                duration: String(alertConfiguration.duration),
-                recipient: alertConfiguration.recipient
-            });
-            fetch('/trigger-alert?' + query.toString())
-                .then(response => {
-                    if (!response.ok) throw new Error("Server returned HTTP " + response.status);
-                    return response.text();
-                })
-                .then(() => {
-                    document.getElementById("log-state").innerText = "Ready";
-                    addLog(category + " alert accepted; SMS dispatch completed.", "success");
-                })
-                .catch(error => {
-                    document.getElementById("log-state").innerText = "Attention";
-                    addLog(category + " alert was not confirmed: " + error.message, "error");
-                    console.error('Error:', error);
-                });
-        }
-    </script>
-</body>
-</html>
-"""
-
-
-@app.route("/manifest.json")
-def manifest():
-    return jsonify(
-        {
-            "name": f"{PRODUCT_NAME} Emergency Alert System",
-            "short_name": PRODUCT_NAME,
-            "start_url": "/",
-            "display": "standalone",
-            "background_color": "#f8fafc",
-            "theme_color": "#b91c1c",
-            "icons": [
-                {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png"},
-                {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png"},
-            ],
-        }
-    )
-
-
-@app.route("/icon-<int:size>.png")
-def icon(size):
-    if size not in (192, 512):
-        return "Not found", 404
-    png_bytes = _solid_color_png(size, (185, 28, 28))  # matches btn-security crimson
-    return Response(png_bytes, mimetype="image/png")
-
-
-@app.route("/sw.js")
-def service_worker():
-    # Minimal service worker: required for installability, but deliberately does NOT
-    # cache anything, so the emergency dashboard never shows stale content offline.
-    sw_code = """
-    self.addEventListener('install', (event) => { self.skipWaiting(); });
-    self.addEventListener('activate', (event) => { event.waitUntil(self.clients.claim()); });
-    self.addEventListener('fetch', (event) => { event.respondWith(fetch(event.request)); });
-    """
-    return Response(sw_code, mimetype="application/javascript")
-
-
-@app.route("/")
-def home():
-    return render_template_string(
-        WEB_PAGE,
-        product_name=PRODUCT_NAME,
-        video_duration=VIDEO_DURATION_SECONDS,
-        recipient_values=(
-            [
-                display_recipient(recipient)
-                for recipient in recipient_list(TARGET_MOBILE)
-            ]
-            + [""] * 10
-        )[:10],
-    )
-
-
-@app.route("/configuration", methods=["POST"])
-def save_configuration():
-    global VIDEO_DURATION_SECONDS, TARGET_MOBILE
-
-    settings = request.get_json(silent=True) or {}
+def process_event(event):
+    button_id = str(event.get("button", "unknown"))
     try:
-        duration_seconds = max(
-            1, min(300, int(settings.get("duration", VIDEO_DURATION_SECONDS)))
-        )
+        duration = max(1, min(300, int(event.get("duration", VIDEO_DURATION_SECONDS))))
     except (TypeError, ValueError):
-        return jsonify(error="Video duration must be a number from 1 to 300"), 400
-
-    recipients = recipient_list(settings.get("recipient", TARGET_MOBILE))
-    if not recipients:
-        return jsonify(error="At least one SMS recipient is required"), 400
-    recipient = ",".join(recipients)
-
-    VIDEO_DURATION_SECONDS = duration_seconds
-    TARGET_MOBILE = recipient
-    save_config_file(
-        {
-            "VIDEO_DURATION_SECONDS": duration_seconds,
-            "TARGET_MOBILE": recipient,
-        }
-    )
-    return jsonify(message="Configuration saved"), 200
-
-
-@app.route("/trigger-alert", methods=["GET"])
-def trigger_alert():
-    button_id = request.args.get("button", "unknown")
-    try:
-        duration_seconds = max(
-            1, min(300, int(request.args.get("duration", VIDEO_DURATION_SECONDS)))
-        )
-    except (TypeError, ValueError):
-        duration_seconds = VIDEO_DURATION_SECONDS
-    recipient = ",".join(recipient_list(request.args.get("recipient", TARGET_MOBILE)))
-
-    categories = {"1": "Hazard", "2": "Security", "3": "Medical Concern"}
-    category_name = categories.get(button_id, "General Emergency")
-    current_time = datetime.now().strftime("%B %d, %Y - %I:%M %p")
-    video_filename = os.path.abspath(
+        duration = VIDEO_DURATION_SECONDS
+    filename = os.path.abspath(
         f"evidence_btn{button_id}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.mp4"
     )
-    video_available = bool(RTSP_URL) and shutil.which(FFMPEG_PATH) is not None
+    if record_cctv_stream(filename, duration):
+        upload_video(filename)
 
-    threading.Thread(
-        target=record_and_upload,
-        args=(button_id, video_filename, duration_seconds),
-        daemon=True,
-    ).start()
 
-    sms_text = (
-        f"{PRODUCT_NAME} EMERGENCY ALERT\n\n"
-        f"Category: {category_name}\n"
-        f"Location: STEM Department Building – STEM 12 Newton Room\n"
-        f"Time: {current_time}\n\n"
-        f"An emergency alert has been activated. Please proceed to the indicated location immediately and assess the situation. Visual incident documentation will be transmitted for review.\n\n"
-        f"Video: {video_url(video_filename, video_available)}\n\n"
-        f"— {PRODUCT_NAME} Emergency Alert System"
-    )
+def poll_events():
+    if not VPS_EVENT_ENDPOINT:
+        print("VPS_EVENT_ENDPOINT is not configured")
+        return
 
-    if SEND_SMS:
-        headers = {
-            "Authorization": f"Bearer {PHILSMS_TOKEN}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        }
-
+    headers = {"Authorization": f"Bearer {VPS_EVENT_TOKEN}"}
+    while True:
         try:
-            for recipient_number in recipient_list(recipient):
-                payload = {
-                    "recipient": recipient_number,
-                    "sender_id": SENDER_ID,
-                    "type": "plain",
-                    "message": sms_text,
-                }
-                response = requests.post(PHILSMS_URL, json=payload, headers=headers)
-                response.raise_for_status()
-                print(
-                    f"Alert dispatched to {recipient_number} | Status: {response.status_code}"
-                )
-            return "SMS dispatched to all recipients", 200
-        except Exception as e:
-            print(f"SMS Dispatch Error: {str(e)}")
-            return str(e), 500
-
-    print("SMS disabled; video capture/upload continues")
-    return "Alert processed without SMS", 200
+            response = requests.get(VPS_EVENT_ENDPOINT, headers=headers, timeout=15)
+            response.raise_for_status()
+            event = response.json().get("event")
+            if event:
+                process_event(event)
+        except (requests.RequestException, ValueError, TypeError) as error:
+            print(f"VPS event polling error: {error}")
+        time.sleep(POLL_INTERVAL_SECONDS)
 
 
 if __name__ == "__main__":
-    _zeroconf = start_mdns()
-    try:
-        app.run(host="0.0.0.0", port=APP_PORT, debug=False)
-    finally:
-        if _zeroconf:
-            _zeroconf.close()
+    print("ALERTO video worker started")
+    poll_events()
