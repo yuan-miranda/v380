@@ -88,11 +88,17 @@ def save_config_file(settings):
 
 def recipient_list(value):
     values = str(value).replace(";", ",").replace("\n", ",").split(",")
-    return [normalize_recipient(recipient) for recipient in values if normalize_recipient(recipient)]
+    return [
+        normalize_recipient(recipient)
+        for recipient in values
+        if normalize_recipient(recipient)
+    ]
 
 
 def normalize_recipient(value):
-    digits = "".join(character for character in str(value).strip() if character.isdigit())
+    digits = "".join(
+        character for character in str(value).strip() if character.isdigit()
+    )
     if digits.startswith("09") and len(digits) == 11:
         return "63" + digits[1:]
     if digits.startswith("9") and len(digits) == 10:
@@ -168,6 +174,7 @@ def start_mdns():
 
 def _solid_color_png(size, rgb):
     """Build a minimal valid solid-color PNG without any image library dependency."""
+
     def chunk(tag, data):
         return (
             struct.pack(">I", len(data))
@@ -267,6 +274,7 @@ def video_url(filename, video_available):
         return VIDEO_PLACEHOLDER_URL
     token = f"?token={VIDEO_URL_TOKEN}" if VIDEO_URL_TOKEN else ""
     return f"{VIDEO_URL_BASE.rstrip('/')}/{os.path.basename(filename)}{token}"
+
 
 # Modern, Professional Mobile-Centric UI Template
 WEB_PAGE = """
@@ -475,18 +483,20 @@ WEB_PAGE = """
 
 @app.route("/manifest.json")
 def manifest():
-    return jsonify({
-        "name": f"{PRODUCT_NAME} Emergency Alert System",
-        "short_name": PRODUCT_NAME,
-        "start_url": "/",
-        "display": "standalone",
-        "background_color": "#f8fafc",
-        "theme_color": "#b91c1c",
-        "icons": [
-            {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png"},
-            {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png"},
-        ],
-    })
+    return jsonify(
+        {
+            "name": f"{PRODUCT_NAME} Emergency Alert System",
+            "short_name": PRODUCT_NAME,
+            "start_url": "/",
+            "display": "standalone",
+            "background_color": "#f8fafc",
+            "theme_color": "#b91c1c",
+            "icons": [
+                {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png"},
+                {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png"},
+            ],
+        }
+    )
 
 
 @app.route("/icon-<int:size>.png")
@@ -515,7 +525,13 @@ def home():
         WEB_PAGE,
         product_name=PRODUCT_NAME,
         video_duration=VIDEO_DURATION_SECONDS,
-        recipient_values=([display_recipient(recipient) for recipient in recipient_list(TARGET_MOBILE)] + [""] * 10)[:10],
+        recipient_values=(
+            [
+                display_recipient(recipient)
+                for recipient in recipient_list(TARGET_MOBILE)
+            ]
+            + [""] * 10
+        )[:10],
     )
 
 
@@ -525,7 +541,9 @@ def save_configuration():
 
     settings = request.get_json(silent=True) or {}
     try:
-        duration_seconds = max(1, min(300, int(settings.get("duration", VIDEO_DURATION_SECONDS))))
+        duration_seconds = max(
+            1, min(300, int(settings.get("duration", VIDEO_DURATION_SECONDS)))
+        )
     except (TypeError, ValueError):
         return jsonify(error="Video duration must be a number from 1 to 300"), 400
 
@@ -536,10 +554,12 @@ def save_configuration():
 
     VIDEO_DURATION_SECONDS = duration_seconds
     TARGET_MOBILE = recipient
-    save_config_file({
-        "VIDEO_DURATION_SECONDS": duration_seconds,
-        "TARGET_MOBILE": recipient,
-    })
+    save_config_file(
+        {
+            "VIDEO_DURATION_SECONDS": duration_seconds,
+            "TARGET_MOBILE": recipient,
+        }
+    )
     return jsonify(message="Configuration saved"), 200
 
 
@@ -547,7 +567,9 @@ def save_configuration():
 def trigger_alert():
     button_id = request.args.get("button", "unknown")
     try:
-        duration_seconds = max(1, min(300, int(request.args.get("duration", VIDEO_DURATION_SECONDS))))
+        duration_seconds = max(
+            1, min(300, int(request.args.get("duration", VIDEO_DURATION_SECONDS)))
+        )
     except (TypeError, ValueError):
         duration_seconds = VIDEO_DURATION_SECONDS
     recipient = ",".join(recipient_list(request.args.get("recipient", TARGET_MOBILE)))
@@ -593,7 +615,9 @@ def trigger_alert():
                 }
                 response = requests.post(PHILSMS_URL, json=payload, headers=headers)
                 response.raise_for_status()
-                print(f"Alert dispatched to {recipient_number} | Status: {response.status_code}")
+                print(
+                    f"Alert dispatched to {recipient_number} | Status: {response.status_code}"
+                )
             return "SMS dispatched to all recipients", 200
         except Exception as e:
             print(f"SMS Dispatch Error: {str(e)}")
