@@ -5,6 +5,7 @@ import struct
 import threading
 from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 import zlib
 
 import requests
@@ -51,9 +52,31 @@ SEND_SMS = os.getenv("SEND_SMS", "false").lower() in {"1", "true", "yes", "on"}
 TARGET_MOBILE = os.getenv("TARGET_MOBILE", "")
 VIDEO_DURATION_SECONDS = int(os.getenv("VIDEO_DURATION_SECONDS", "60"))
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://178.128.82.49:5000")
+MANILA_TIMEZONE = ZoneInfo("Asia/Manila")
 CONFIG_PATH = Path(__file__).resolve().with_name("config.json")
 pending_events = []
 events_lock = threading.Lock()
+
+
+def load_saved_configuration():
+    if not CONFIG_PATH.is_file():
+        return
+    try:
+        settings = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        logger.warning("Could not load config.json: %s", error)
+        return
+
+    global VIDEO_DURATION_SECONDS, TARGET_MOBILE
+    try:
+        VIDEO_DURATION_SECONDS = max(1, min(300, int(settings.get("VIDEO_DURATION_SECONDS", VIDEO_DURATION_SECONDS))))
+    except (TypeError, ValueError):
+        logger.warning("Invalid VIDEO_DURATION_SECONDS in config.json; using %s", VIDEO_DURATION_SECONDS)
+    saved_recipients = recipient_list(settings.get("TARGET_MOBILE", TARGET_MOBILE))
+    if saved_recipients:
+        TARGET_MOBILE = ",".join(saved_recipients)
+    logger.info("Loaded config.json: duration=%ss recipients=%s", VIDEO_DURATION_SECONDS, recipient_list(TARGET_MOBILE))
+
 
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_SIZE
@@ -88,6 +111,9 @@ def normalize_recipient(value):
 def display_recipient(value):
     normalized = normalize_recipient(value)
     return "0" + normalized[2:] if normalized else ""
+
+
+load_saved_configuration()
 
 
 WEB_PAGE = """
@@ -266,13 +292,11 @@ def trigger_alert():
         message = (
             f"{PRODUCT_NAME} EMERGENCY ALERT\n\n"
             f"Category: {category}\n"
-            "Location: STEM Department Building - STEM 12 Newton Room\n"
-            f"Time: {datetime.now().strftime('%B %d, %Y - %I:%M %p')}\n\n"
-            "An emergency alert has been activated. Please proceed to the indicated "
-            "location immediately and assess the situation. Visual incident "
-            "documentation will be transmitted for review.\n\n"
+            "STEM 12 Newton Room\n"
+            f"{datetime.now(MANILA_TIMEZONE).strftime('%B %d, %Y — %I:%M %p')}\n\n"
+            "Please proceed to the indicated location immediately and assess the situation. "
+            "Visual incident documentation will be transmitted for review.\n\n"
             f"Video: {PUBLIC_BASE_URL.rstrip('/')}/videos?token={VIEW_TOKEN}\n\n"
-            f"- {PRODUCT_NAME} Emergency Alert System"
         )
         headers = {"Authorization": f"Bearer {PHILSMS_TOKEN}", "Content-Type": "application/json"}
         for recipient in recipients:
@@ -333,9 +357,12 @@ def list_videos():
     )
 
     links = "".join(
-        f'<li><a href="/videos/{path.name}?token={VIEW_TOKEN}">{path.name}</a>'
-        f' ({path.stat().st_size / (1024 * 1024):.1f} MB)</li>'
-        for path in videos
+        f'<li>'
+        f'<a href="/videos/{path.name}?token={VIEW_TOKEN}">'
+        f'{datetime.fromtimestamp(path.stat().st_mtime, tz=ZoneInfo("UTC")).astimezone(MANILA_TIMEZONE).strftime("%m/%d/%Y - %I:%M:%S %p")}'
+        f'</a> ({path.stat().st_size / (1024 * 1024):.1f} MB)'
+        f'{" [LATEST]" if index == 0 else ""}</li>'
+        for index, path in enumerate(videos)
     )
 
     return f"""
