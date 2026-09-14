@@ -103,6 +103,44 @@ def render_sms_message(category):
     )
 
 
+def send_sms_notification(button_id):
+    category = ALERT_CATEGORIES.get(button_id, "Hazard")
+    recipients = recipient_list(TARGET_MOBILE)
+    if SEND_SMS and PHILSMS_URL and PHILSMS_TOKEN:
+        try:
+            message = render_sms_message(category)
+        except ValueError:
+            message = DEFAULT_SMS_TEMPLATE.format_map(
+                TemplateValues(
+                    product_name=PRODUCT_NAME,
+                    category=category,
+                    timestamp=datetime.now(MANILA_TIMEZONE).strftime("%B %d, %Y — %I:%M %p"),
+                    video_url=f"{PUBLIC_BASE_URL.rstrip('/')}/videos?token={VIEW_TOKEN}"
+                )
+            )
+        headers = {"Authorization": f"Bearer {PHILSMS_TOKEN}", "Content-Type": "application/json"}
+        for recipient in recipients:
+            try:
+                requests.post(
+                    PHILSMS_URL,
+                    json={
+                        "recipient": recipient,
+                        "sender_id": SENDER_ID,
+                        "type": "plain",
+                        "message": message,
+                    },
+                    headers=headers,
+                    timeout=20,
+                ).raise_for_status()
+                logger.info("SMS sent: recipient=%s button=%s", recipient, button_id)
+            except requests.RequestException as error:
+                logger.error("SMS failed: recipient=%s error=%s", recipient, error)
+    elif not SEND_SMS:
+        logger.info("SMS disabled: recipients=%s", recipients)
+    else:
+        logger.warning("SMS not sent: PHILSMS_URL or PHILSMS_TOKEN is missing")
+
+
 def load_saved_configuration():
     if not CONFIG_PATH.is_file():
         return
@@ -460,7 +498,9 @@ def create_event():
     record_activity(
         f"{ALERT_CATEGORIES[button_id]} alert queued from device.", "pending"
     )
-    return jsonify(message="Event queued"), 202
+    send_sms_notification(button_id)
+    record_activity(f"{ALERT_CATEGORIES[button_id]} alert accepted.", "success")
+    return jsonify(message="Event queued and SMS dispatched"), 202
 
 
 @app.post("/configuration")
@@ -549,45 +589,7 @@ def trigger_alert():
         "Working",
     )
 
-    if SEND_SMS and PHILSMS_URL and PHILSMS_TOKEN:
-        try:
-            message = render_sms_message(category)
-        except ValueError as error:
-            logger.error("SMS template invalid: %s", error)
-            message = DEFAULT_SMS_TEMPLATE.format_map(
-                TemplateValues(
-                    product_name=PRODUCT_NAME,
-                    category=category,
-                    timestamp=datetime.now(MANILA_TIMEZONE).strftime(
-                        "%B %d, %Y — %I:%M %p"
-                    ),
-                    video_url=f"{PUBLIC_BASE_URL.rstrip('/')}/videos?token={VIEW_TOKEN}",
-                )
-            )
-        headers = {
-            "Authorization": f"Bearer {PHILSMS_TOKEN}",
-            "Content-Type": "application/json",
-        }
-        for recipient in recipients:
-            try:
-                requests.post(
-                    PHILSMS_URL,
-                    json={
-                        "recipient": recipient,
-                        "sender_id": SENDER_ID,
-                        "type": "plain",
-                        "message": message,
-                    },
-                    headers=headers,
-                    timeout=20,
-                ).raise_for_status()
-                logger.info("SMS sent: recipient=%s button=%s", recipient, button_id)
-            except requests.RequestException as error:
-                logger.error("SMS failed: recipient=%s error=%s", recipient, error)
-    elif not SEND_SMS:
-        logger.info("SMS disabled: recipients=%s", recipients)
-    else:
-        logger.warning("SMS not sent: PHILSMS_URL or PHILSMS_TOKEN is missing")
+    send_sms_notification(button_id)
 
     record_activity(f"{category} alert accepted.", "success", "Ready")
     return "Alert queued; the phone worker will record and upload the video.", 202
