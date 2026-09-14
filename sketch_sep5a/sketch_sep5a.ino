@@ -4,15 +4,15 @@
 const char* ssid = "Converge_2.4GHz_BtM2";
 const char* password = "Xd4AjFnJ";
 
-// Replace with your computer's local IP running Python Flask
-const char* serverIp = "192.168.100.58"; 
+// VPS public IP; button events are queued there for the phone to poll.
+const char* serverIp = "178.128.82.49";
+const char* eventToken = "qqqq";
 
 const int buttonPins[] = {15, 16, 17};
 const int numButtons = 3;
 
 int buttonState[numButtons];
 int lastButtonState[numButtons];
-unsigned long clickCount[numButtons];
 unsigned long lastDebounceTime[numButtons];
 unsigned long debounceDelay = 50;
 
@@ -30,7 +30,6 @@ void setup() {
     pinMode(buttonPins[i], INPUT_PULLUP);
     buttonState[i] = digitalRead(buttonPins[i]);
     lastButtonState[i] = HIGH;
-    clickCount[i] = 0;
     lastDebounceTime[i] = 0;
   }
 }
@@ -46,21 +45,22 @@ void loop() {
     if ((millis() - lastDebounceTime[i]) > debounceDelay) {
       if (reading != buttonState[i]) {
         if (buttonState[i] == LOW && reading == HIGH) {
-          clickCount[i]++;
           int buttonNumber = i + 1; // Maps pin index to Button 1, 2, or 3
           
           Serial.print("Button ");
           Serial.print(buttonNumber);
-          Serial.println(" clicked! Sending SMS request...");
+          Serial.println(" clicked! Sending event to VPS...");
 
           if (WiFi.status() == WL_CONNECTED) {
             HTTPClient http;
             
-            // Construct URL dynamically like http://192.168.100.X:5000/send-sms?button=1
-            String url = String("http://") + serverIp + ":5000/send-sms?button=" + String(buttonNumber);
+            String url = String("http://") + serverIp + ":5000/events";
             
             http.begin(url);
-            int httpResponseCode = http.GET();
+            http.addHeader("Authorization", String("Bearer ") + eventToken);
+            http.addHeader("Content-Type", "application/json");
+            String body = String("{\"button\":\"") + buttonNumber + "\"}";
+            int httpResponseCode = http.POST(body);
             
             if (httpResponseCode > 0) {
               Serial.print("Server Response Code: ");
