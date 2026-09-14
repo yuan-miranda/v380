@@ -375,6 +375,30 @@ def worker_config():
     return jsonify(cctv_ip=CCTV_IP, duration=VIDEO_DURATION_SECONDS)
 
 
+@app.get("/worker-env")
+def worker_env():
+    if not has_token(EVENT_TOKEN):
+        return jsonify(error="Unauthorized"), 401
+    
+    env_path = Path(__file__).resolve().with_name(".env")
+    if env_path.is_file():
+        return Response(env_path.read_text(encoding="utf-8"), mimetype="text/plain")
+    
+    fallback_env = f"""CCTV_IP={CCTV_IP}
+VIDEO_DURATION_SECONDS={VIDEO_DURATION_SECONDS}
+VPS_ENDPOINT={PUBLIC_BASE_URL.rstrip('/')}/upload
+VPS_TOKEN={UPLOAD_TOKEN}
+VPS_EVENT_ENDPOINT={PUBLIC_BASE_URL.rstrip('/')}/events/next
+VPS_EVENT_TOKEN={EVENT_TOKEN}
+VPS_CONFIG_ENDPOINT={PUBLIC_BASE_URL.rstrip('/')}/worker-config
+VPS_ENV_ENDPOINT={PUBLIC_BASE_URL.rstrip('/')}/worker-env
+RTSP_USER=admin
+RTSP_PASS=password
+POLL_INTERVAL_SECONDS=2
+"""
+    return Response(fallback_env, mimetype="text/plain")
+
+
 @app.post("/events")
 def create_event():
     if not has_token(EVENT_TOKEN):

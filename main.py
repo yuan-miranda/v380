@@ -1,12 +1,13 @@
-import os
+import json
 import logging
+import os
 import shutil
 import subprocess
 import time
 from datetime import datetime
+from pathlib import Path
 
 import requests
-
 
 logging.basicConfig(
     level=logging.INFO,
@@ -14,50 +15,77 @@ logging.basicConfig(
 )
 logger = logging.getLogger("alerto.worker")
 
+CONFIG_FILE = Path("config.json")
+ENV_FILE = Path(".env")
 
-def load_env_file(filename=".env"):
-    if not os.path.exists(filename):
-        return
-    with open(filename, encoding="utf-8") as env_file:
-        for line in env_file:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+DEFAULT_VPS_ENV_ENDPOINT = "http://alerto.ddns.net/worker-env"
+DEFAULT_VPS_EVENT_TOKEN = "qqqq"
 
 
-load_env_file()
+def load_local_env():
+    if ENV_FILE.is_file():
+        with open(ENV_FILE, encoding="utf-8") as env_file:
+            for line in env_file:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+load_local_env()
+
+VPS_ENV_ENDPOINT = os.getenv("VPS_ENV_ENDPOINT", DEFAULT_VPS_ENV_ENDPOINT)
+VPS_EVENT_TOKEN = os.getenv("VPS_EVENT_TOKEN", DEFAULT_VPS_EVENT_TOKEN)
+
+
+def sync_server_env_to_config():
+    try:
+        logger.info("Pulling configuration profile from server: %s", VPS_ENV_ENDPOINT)
+        response = requests.get(
+            VPS_ENV_ENDPOINT,
+            headers={"Authorization": f"Bearer {VPS_EVENT_TOKEN}"},
+            timeout=10,
+        )
+        if response.status_code == 200:
+            env_text = response.text
+            ENV_FILE.write_text(env_text, encoding="utf-8")
+            
+            config_data = {}
+            for line in env_text.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                config_data[key.strip()] = value.strip().strip('"').strip("'")
+            
+            CONFIG_FILE.write_text(json.dumps(config_data, indent=2), encoding="utf-8")
+            logger.info("Successfully synchronized server config into local config.json.")
+        else:
+            logger.warning("Server returned status %s during config sync; using local fallback.", response.status_code)
+    except requests.RequestException as error:
+        logger.warning("Could not reach server for environment sync: %s. Using local config.", error)
+
+
+sync_server_env_to_config()
+load_local_env()
 
 FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg")
 VPS_ENDPOINT = os.getenv("VPS_ENDPOINT", "")
 VPS_TOKEN = os.getenv("VPS_TOKEN", "")
 VPS_EVENT_ENDPOINT = os.getenv("VPS_EVENT_ENDPOINT", "")
 VPS_EVENT_TOKEN = os.getenv("VPS_EVENT_TOKEN", VPS_TOKEN)
-VPS_CONFIG_ENDPOINT = os.getenv("VPS_CONFIG_ENDPOINT", "")
 POLL_INTERVAL_SECONDS = float(os.getenv("POLL_INTERVAL_SECONDS", "2"))
 VIDEO_DURATION_SECONDS = int(os.getenv("VIDEO_DURATION_SECONDS", "60"))
+CCTV_IP = os.getenv("CCTV_IP", "192.168.100.57")
 RTSP_USER = os.getenv("RTSP_USER", "admin")
 RTSP_PASS = os.getenv("RTSP_PASS", "password")
 
 
 def get_live_rtsp_url():
-    if VPS_CONFIG_ENDPOINT:
-        try:
-            response = requests.get(
-                VPS_CONFIG_ENDPOINT,
-                headers={"Authorization": f"Bearer {VPS_EVENT_TOKEN}"},
-                timeout=5,
-            )
-            if response.ok:
-                ip = response.json().get("cctv_ip")
-                if ip:
-                    return f"rtsp://{RTSP_USER}:{RTSP_PASS}@{ip}:554/live/ch00_0"
-        except requests.RequestException as error:
-            logger.warning("Could not fetch latest CCTV IP from server, falling back: %s", error)
-
-    fallback_ip = os.getenv("CCTV_IP", "192.168.100.57")
-    return f"rtsp://{RTSP_USER}:{RTSP_PASS}@{fallback_ip}:554/live/ch00_0"
+    load_local_env()
+    current_ip = os.getenv("CCTV_IP", CCTV_IP)
+    return f"rtsp://{RTSP_USER}:{RTSP_PASS}@{current_ip}:554/live/ch00_0"
 
 
 def record_cctv_stream(filename, duration_seconds):
