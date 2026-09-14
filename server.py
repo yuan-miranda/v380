@@ -9,10 +9,17 @@ from zoneinfo import ZoneInfo
 import zlib
 
 import requests
-from flask import Flask, Response, abort, jsonify, render_template_string, request, send_from_directory
+from flask import (
+    Flask,
+    Response,
+    abort,
+    jsonify,
+    render_template_string,
+    request,
+    send_from_directory,
+)
 from flask_sock import Sock
 from werkzeug.utils import secure_filename
-
 
 logging.basicConfig(
     level=logging.INFO,
@@ -86,12 +93,14 @@ class TemplateValues(dict):
 
 
 def render_sms_message(category):
-    return SMS_TEMPLATE.format_map(TemplateValues(
-        product_name=PRODUCT_NAME,
-        category=category,
-        timestamp=datetime.now(MANILA_TIMEZONE).strftime("%B %d, %Y — %I:%M %p"),
-        video_url=f"{PUBLIC_BASE_URL.rstrip('/')}/videos?token={VIEW_TOKEN}",
-    ))
+    return SMS_TEMPLATE.format_map(
+        TemplateValues(
+            product_name=PRODUCT_NAME,
+            category=category,
+            timestamp=datetime.now(MANILA_TIMEZONE).strftime("%B %d, %Y — %I:%M %p"),
+            video_url=f"{PUBLIC_BASE_URL.rstrip('/')}/videos?token={VIEW_TOKEN}",
+        )
+    )
 
 
 def load_saved_configuration():
@@ -105,10 +114,18 @@ def load_saved_configuration():
 
     global VIDEO_DURATION_SECONDS, TARGET_MOBILE, SMS_TEMPLATE, CCTV_IP
     try:
-        VIDEO_DURATION_SECONDS = max(1, min(300, int(settings.get("VIDEO_DURATION_SECONDS", VIDEO_DURATION_SECONDS))))
+        VIDEO_DURATION_SECONDS = max(
+            1,
+            min(
+                300, int(settings.get("VIDEO_DURATION_SECONDS", VIDEO_DURATION_SECONDS))
+            ),
+        )
     except (TypeError, ValueError):
-        logger.warning("Invalid VIDEO_DURATION_SECONDS in config.json; using %s", VIDEO_DURATION_SECONDS)
-    
+        logger.warning(
+            "Invalid VIDEO_DURATION_SECONDS in config.json; using %s",
+            VIDEO_DURATION_SECONDS,
+        )
+
     saved_ip = str(settings.get("CCTV_IP", CCTV_IP) or "").strip()
     if saved_ip:
         CCTV_IP = saved_ip
@@ -119,7 +136,12 @@ def load_saved_configuration():
     saved_template = str(settings.get("SMS_TEMPLATE", SMS_TEMPLATE) or "").strip()
     if saved_template:
         SMS_TEMPLATE = saved_template
-    logger.info("Loaded config.json: duration=%ss cctv_ip=%s recipients=%s", VIDEO_DURATION_SECONDS, CCTV_IP, recipient_list(TARGET_MOBILE))
+    logger.info(
+        "Loaded config.json: duration=%ss cctv_ip=%s recipients=%s",
+        VIDEO_DURATION_SECONDS,
+        CCTV_IP,
+        recipient_list(TARGET_MOBILE),
+    )
 
 
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -127,7 +149,10 @@ app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_SIZE
 
 
 def has_token(expected_token):
-    return bool(expected_token) and request.headers.get("Authorization") == f"Bearer {expected_token}"
+    return (
+        bool(expected_token)
+        and request.headers.get("Authorization") == f"Bearer {expected_token}"
+    )
 
 
 def has_view_token():
@@ -142,7 +167,9 @@ def recipient_list(value):
 
 
 def normalize_recipient(value):
-    digits = "".join(character for character in str(value).strip() if character.isdigit())
+    digits = "".join(
+        character for character in str(value).strip() if character.isdigit()
+    )
     if digits.startswith("09") and len(digits) == 11:
         return "63" + digits[1:]
     if digits.startswith("9") and len(digits) == 10:
@@ -162,7 +189,9 @@ def configuration_payload():
     return {
         "duration": VIDEO_DURATION_SECONDS,
         "cctv_ip": CCTV_IP,
-        "recipients": ([display_recipient(recipient) for recipient in recipients] + [""] * 10)[:10],
+        "recipients": (
+            [display_recipient(recipient) for recipient in recipients] + [""] * 10
+        )[:10],
         "message": SMS_TEMPLATE,
     }
 
@@ -318,7 +347,9 @@ def home():
         product_name=PRODUCT_NAME,
         duration=saved.get("VIDEO_DURATION_SECONDS", VIDEO_DURATION_SECONDS),
         cctv_ip=saved.get("CCTV_IP", CCTV_IP),
-        recipient_values=([display_recipient(recipient) for recipient in recipients] + [""] * 10)[:10],
+        recipient_values=(
+            [display_recipient(recipient) for recipient in recipients] + [""] * 10
+        )[:10],
         sms_template=saved.get("SMS_TEMPLATE", SMS_TEMPLATE),
         default_sms_template=DEFAULT_SMS_TEMPLATE,
     )
@@ -326,18 +357,20 @@ def home():
 
 @app.get("/manifest.json")
 def manifest():
-    return jsonify({
-        "name": f"{PRODUCT_NAME} Emergency Alert System",
-        "short_name": PRODUCT_NAME,
-        "start_url": "/",
-        "display": "standalone",
-        "background_color": "#f8fafc",
-        "theme_color": "#b91c1c",
-        "icons": [
-            {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png"},
-            {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png"},
-        ],
-    })
+    return jsonify(
+        {
+            "name": f"{PRODUCT_NAME} Emergency Alert System",
+            "short_name": PRODUCT_NAME,
+            "start_url": "/",
+            "display": "standalone",
+            "background_color": "#f8fafc",
+            "theme_color": "#b91c1c",
+            "icons": [
+                {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png"},
+                {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png"},
+            ],
+        }
+    )
 
 
 @app.get("/icon-<int:size>.png")
@@ -346,7 +379,12 @@ def icon(size):
         return "Not found", 404
 
     def chunk(tag, data):
-        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+        return (
+            struct.pack(">I", len(data))
+            + tag
+            + data
+            + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+        )
 
     row = b"\x00" + bytes((185, 28, 28)) * size
     png = b"\x89PNG\r\n\x1a\n"
@@ -379,11 +417,11 @@ def worker_config():
 def worker_env():
     if not has_token(EVENT_TOKEN):
         return jsonify(error="Unauthorized"), 401
-    
+
     env_path = Path(__file__).resolve().with_name(".env")
     if env_path.is_file():
         return Response(env_path.read_text(encoding="utf-8"), mimetype="text/plain")
-    
+
     fallback_env = f"""CCTV_IP={CCTV_IP}
 VIDEO_DURATION_SECONDS={VIDEO_DURATION_SECONDS}
 VPS_ENDPOINT={PUBLIC_BASE_URL.rstrip('/')}/upload
@@ -413,8 +451,15 @@ def create_event():
     with events_lock:
         pending_events.append({"button": button_id, "duration": duration})
         queue_size = len(pending_events)
-    logger.info("ESP32 event queued: button=%s duration=%ss queue_size=%s", button_id, duration, queue_size)
-    record_activity(f"{ALERT_CATEGORIES[button_id]} alert queued from device.", "pending")
+    logger.info(
+        "ESP32 event queued: button=%s duration=%ss queue_size=%s",
+        button_id,
+        duration,
+        queue_size,
+    )
+    record_activity(
+        f"{ALERT_CATEGORIES[button_id]} alert queued from device.", "pending"
+    )
     return jsonify(message="Event queued"), 202
 
 
@@ -423,7 +468,9 @@ def save_configuration():
     global VIDEO_DURATION_SECONDS, TARGET_MOBILE, SMS_TEMPLATE, CCTV_IP
     settings = request.get_json(silent=True) or {}
     try:
-        duration = max(1, min(300, int(settings.get("duration", VIDEO_DURATION_SECONDS))))
+        duration = max(
+            1, min(300, int(settings.get("duration", VIDEO_DURATION_SECONDS)))
+        )
     except (TypeError, ValueError):
         return jsonify(error="Video duration must be between 1 and 300 seconds"), 400
 
@@ -438,23 +485,38 @@ def save_configuration():
     if not message:
         return jsonify(error="SMS message template is required"), 400
     try:
-        message.format_map(TemplateValues(product_name="", category="", timestamp="", video_url=""))
+        message.format_map(
+            TemplateValues(product_name="", category="", timestamp="", video_url="")
+        )
     except ValueError:
-        return jsonify(error="SMS message has invalid braces. Use {product_name}, {category}, {timestamp}, {video_url}"), 400
+        return (
+            jsonify(
+                error="SMS message has invalid braces. Use {product_name}, {category}, {timestamp}, {video_url}"
+            ),
+            400,
+        )
     VIDEO_DURATION_SECONDS = duration
     CCTV_IP = cctv_ip
     TARGET_MOBILE = ",".join(recipients)
     SMS_TEMPLATE = message
     CONFIG_PATH.write_text(
-        json.dumps({
-            "VIDEO_DURATION_SECONDS": duration,
-            "CCTV_IP": CCTV_IP,
-            "TARGET_MOBILE": TARGET_MOBILE,
-            "SMS_TEMPLATE": SMS_TEMPLATE,
-        }, indent=2),
+        json.dumps(
+            {
+                "VIDEO_DURATION_SECONDS": duration,
+                "CCTV_IP": CCTV_IP,
+                "TARGET_MOBILE": TARGET_MOBILE,
+                "SMS_TEMPLATE": SMS_TEMPLATE,
+            },
+            indent=2,
+        ),
         encoding="utf-8",
     )
-    logger.info("Configuration saved: duration=%ss cctv_ip=%s recipients=%s", duration, CCTV_IP, recipients)
+    logger.info(
+        "Configuration saved: duration=%ss cctv_ip=%s recipients=%s",
+        duration,
+        CCTV_IP,
+        recipients,
+    )
     broadcast({"type": "configuration", **configuration_payload()})
     record_activity("Configuration saved.", "success")
     return jsonify(message="Configuration saved"), 200
@@ -466,30 +528,59 @@ def trigger_alert():
     if button_id not in {"1", "2", "3"}:
         return "Invalid alert button", 400
 
-    duration = max(1, min(300, int(request.args.get("duration", VIDEO_DURATION_SECONDS))))
+    duration = max(
+        1, min(300, int(request.args.get("duration", VIDEO_DURATION_SECONDS)))
+    )
     with events_lock:
         pending_events.append({"button": button_id, "duration": duration})
         queue_size = len(pending_events)
     recipients = recipient_list(TARGET_MOBILE)
     category = ALERT_CATEGORIES[button_id]
-    logger.info("Website alert queued: button=%s duration=%ss queue_size=%s recipients=%s", button_id, duration, queue_size, recipients)
-    record_activity(f"{category} alert queued; phone worker will record the video.", "pending", "Working")
+    logger.info(
+        "Website alert queued: button=%s duration=%ss queue_size=%s recipients=%s",
+        button_id,
+        duration,
+        queue_size,
+        recipients,
+    )
+    record_activity(
+        f"{category} alert queued; phone worker will record the video.",
+        "pending",
+        "Working",
+    )
 
     if SEND_SMS and PHILSMS_URL and PHILSMS_TOKEN:
         try:
             message = render_sms_message(category)
         except ValueError as error:
             logger.error("SMS template invalid: %s", error)
-            message = DEFAULT_SMS_TEMPLATE.format_map(TemplateValues(
-                product_name=PRODUCT_NAME,
-                category=category,
-                timestamp=datetime.now(MANILA_TIMEZONE).strftime("%B %d, %Y — %I:%M %p"),
-                video_url=f"{PUBLIC_BASE_URL.rstrip('/')}/videos?token={VIEW_TOKEN}",
-            ))
-        headers = {"Authorization": f"Bearer {PHILSMS_TOKEN}", "Content-Type": "application/json"}
+            message = DEFAULT_SMS_TEMPLATE.format_map(
+                TemplateValues(
+                    product_name=PRODUCT_NAME,
+                    category=category,
+                    timestamp=datetime.now(MANILA_TIMEZONE).strftime(
+                        "%B %d, %Y — %I:%M %p"
+                    ),
+                    video_url=f"{PUBLIC_BASE_URL.rstrip('/')}/videos?token={VIEW_TOKEN}",
+                )
+            )
+        headers = {
+            "Authorization": f"Bearer {PHILSMS_TOKEN}",
+            "Content-Type": "application/json",
+        }
         for recipient in recipients:
             try:
-                requests.post(PHILSMS_URL, json={"recipient": recipient, "sender_id": SENDER_ID, "type": "plain", "message": message}, headers=headers, timeout=20).raise_for_status()
+                requests.post(
+                    PHILSMS_URL,
+                    json={
+                        "recipient": recipient,
+                        "sender_id": SENDER_ID,
+                        "type": "plain",
+                        "message": message,
+                    },
+                    headers=headers,
+                    timeout=20,
+                ).raise_for_status()
                 logger.info("SMS sent: recipient=%s button=%s", recipient, button_id)
             except requests.RequestException as error:
                 logger.error("SMS failed: recipient=%s error=%s", recipient, error)
@@ -512,7 +603,9 @@ def next_event():
             return jsonify(event=None), 200
         event = pending_events.pop(0)
         queue_size = len(pending_events)
-    logger.info("Event delivered to phone worker: event=%s queue_size=%s", event, queue_size)
+    logger.info(
+        "Event delivered to phone worker: event=%s queue_size=%s", event, queue_size
+    )
     return jsonify(event=event), 200
 
 
@@ -522,7 +615,11 @@ def websocket(ws):
         clients.add(ws)
     try:
         with send_lock:
-            ws.send(json.dumps({"type": "sync", **configuration_payload(), **activity_snapshot()}))
+            ws.send(
+                json.dumps(
+                    {"type": "sync", **configuration_payload(), **activity_snapshot()}
+                )
+            )
         while True:
             raw = ws.receive()
             if raw is None:
@@ -554,7 +651,11 @@ def upload_video():
         return jsonify(error="Only MP4 files are accepted"), 400
 
     video.save(UPLOAD_DIR / filename)
-    logger.info("Video uploaded: file=%s size=%d bytes", filename, (UPLOAD_DIR / filename).stat().st_size)
+    logger.info(
+        "Video uploaded: file=%s size=%d bytes",
+        filename,
+        (UPLOAD_DIR / filename).stat().st_size,
+    )
     return jsonify(message="Upload successful", filename=filename), 201
 
 
@@ -570,10 +671,10 @@ def list_videos():
     )
 
     links = "".join(
-        f'<li>'
+        f"<li>"
         f'<a href="/videos/{path.name}?token={VIEW_TOKEN}">'
         f'{datetime.fromtimestamp(path.stat().st_mtime, tz=ZoneInfo("UTC")).astimezone(MANILA_TIMEZONE).strftime("%m/%d/%Y - %I:%M:%S %p")}'
-        f'</a> ({path.stat().st_size / (1024 * 1024):.1f} MB)'
+        f"</a> ({path.stat().st_size / (1024 * 1024):.1f} MB)"
         f'{" [LATEST]" if index == 0 else ""}</li>'
         for index, path in enumerate(videos)
     )
@@ -599,7 +700,9 @@ def watch_video(filename):
         return jsonify(error="Unauthorized"), 401
 
     safe_filename = Path(filename)
-    if safe_filename.name != filename or not safe_filename.name.lower().endswith(".mp4"):
+    if safe_filename.name != filename or not safe_filename.name.lower().endswith(
+        ".mp4"
+    ):
         abort(404)
 
     video_path = UPLOAD_DIR / safe_filename.name
