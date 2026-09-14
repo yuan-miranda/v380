@@ -53,6 +53,7 @@ SENDER_ID = os.getenv("SENDER_ID", "PhilSMS")
 SEND_SMS = os.getenv("SEND_SMS", "false").lower() in {"1", "true", "yes", "on"}
 TARGET_MOBILE = os.getenv("TARGET_MOBILE", "")
 VIDEO_DURATION_SECONDS = int(os.getenv("VIDEO_DURATION_SECONDS", "60"))
+CCTV_IP = os.getenv("CCTV_IP", "192.168.100.57")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://alerto.ddns.net")
 MANILA_TIMEZONE = ZoneInfo("Asia/Manila")
 CONFIG_PATH = Path(__file__).resolve().with_name("config.json")
@@ -102,18 +103,23 @@ def load_saved_configuration():
         logger.warning("Could not load config.json: %s", error)
         return
 
-    global VIDEO_DURATION_SECONDS, TARGET_MOBILE, SMS_TEMPLATE
+    global VIDEO_DURATION_SECONDS, TARGET_MOBILE, SMS_TEMPLATE, CCTV_IP
     try:
         VIDEO_DURATION_SECONDS = max(1, min(300, int(settings.get("VIDEO_DURATION_SECONDS", VIDEO_DURATION_SECONDS))))
     except (TypeError, ValueError):
         logger.warning("Invalid VIDEO_DURATION_SECONDS in config.json; using %s", VIDEO_DURATION_SECONDS)
+    
+    saved_ip = str(settings.get("CCTV_IP", CCTV_IP) or "").strip()
+    if saved_ip:
+        CCTV_IP = saved_ip
+
     saved_recipients = recipient_list(settings.get("TARGET_MOBILE", TARGET_MOBILE))
     if saved_recipients:
         TARGET_MOBILE = ",".join(saved_recipients)
     saved_template = str(settings.get("SMS_TEMPLATE", SMS_TEMPLATE) or "").strip()
     if saved_template:
         SMS_TEMPLATE = saved_template
-    logger.info("Loaded config.json: duration=%ss recipients=%s", VIDEO_DURATION_SECONDS, recipient_list(TARGET_MOBILE))
+    logger.info("Loaded config.json: duration=%ss cctv_ip=%s recipients=%s", VIDEO_DURATION_SECONDS, CCTV_IP, recipient_list(TARGET_MOBILE))
 
 
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -155,6 +161,7 @@ def configuration_payload():
     recipients = recipient_list(TARGET_MOBILE)
     return {
         "duration": VIDEO_DURATION_SECONDS,
+        "cctv_ip": CCTV_IP,
         "recipients": ([display_recipient(recipient) for recipient in recipients] + [""] * 10)[:10],
         "message": SMS_TEMPLATE,
     }
@@ -256,7 +263,18 @@ WEB_PAGE = """
     <h2>{{ product_name }}</h2><p class="subtitle">Emergency Reporting System</p>
     <div class="button-stack"><button class="btn-hazard" onclick="triggerAlert(1)">Hazard</button><button class="btn-security" onclick="triggerAlert(2)">Security</button><button class="btn-medical" onclick="triggerAlert(3)">Medical Concern</button></div>
     <section class="activity-log"><div class="log-header"><span>Activity log</span><div class="log-actions"><button class="log-action" id="log-state" type="button" disabled>Ready</button><button class="log-action" type="button" onclick="clearLog()">Clear log</button><button class="log-action" type="button" onclick="document.getElementById('configuration').classList.toggle('open')">Configuration</button></div></div><div id="status"><div class="log-empty">No alerts recorded in this session.</div></div></section>
-    <form class="configuration" id="configuration" onsubmit="saveConfiguration(event)"><label for="duration">Video duration (seconds)</label><input id="duration" type="number" min="1" max="300" value="{{ duration }}" required><label>SMS recipients (up to 10 numbers)</label><div class="recipient-grid">{% for recipient in recipient_values %}<input class="recipient-slot" type="tel" inputmode="tel" autocomplete="tel" maxlength="11" value="{{ recipient }}" placeholder="09XXXXXXXXX">{% endfor %}</div><div class="field-heading"><label for="message">SMS message</label><button class="config-reset" type="button" onclick="resetSmsTemplate()">Reset</button></div><textarea id="message" name="message" required>{{ sms_template }}</textarea><p class="hint">Variables: {product_name}, {category}, {timestamp}, {video_url}</p><button class="config-save" type="submit">Save configuration</button></form>
+    <form class="configuration" id="configuration" onsubmit="saveConfiguration(event)">
+        <label for="cctv_ip">CCTV IP Address</label>
+        <input id="cctv_ip" type="text" value="{{ cctv_ip }}" required>
+        <label for="duration">Video duration (seconds)</label>
+        <input id="duration" type="number" min="1" max="300" value="{{ duration }}" required>
+        <label>SMS recipients (up to 10 numbers)</label>
+        <div class="recipient-grid">{% for recipient in recipient_values %}<input class="recipient-slot" type="tel" inputmode="tel" autocomplete="tel" maxlength="11" value="{{ recipient }}" placeholder="09XXXXXXXXX">{% endfor %}</div>
+        <div class="field-heading"><label for="message">SMS message</label><button class="config-reset" type="button" onclick="resetSmsTemplate()">Reset</button></div>
+        <textarea id="message" name="message" required>{{ sms_template }}</textarea>
+        <p class="hint">Variables: {product_name}, {category}, {timestamp}, {video_url}</p>
+        <button class="config-save" type="submit">Save configuration</button>
+    </form>
     <div class="location">STEM Department Building &bull; STEM 12 Newton Room</div>
 </div>
 <script>
@@ -274,10 +292,10 @@ function logEntryHtml(entry) { return '<div class="log-entry ' + escapeHtml(entr
 function renderLogs(logs) { seenLogIds.clear(); const status = document.getElementById("status"); if (!logs || !logs.length) { status.innerHTML = '<div class="log-empty">No alerts recorded in this session.</div>'; return; } logs.forEach(entry => { if (entry.id) seenLogIds.add(entry.id); }); status.innerHTML = logs.map(logEntryHtml).join(""); }
 function addLogEntry(entry, state) { if (!entry) return; if (entry.id) { if (seenLogIds.has(entry.id)) { if (state) setLogState(state); return; } seenLogIds.add(entry.id); } const status = document.getElementById("status"); const empty = status.querySelector(".log-empty"); if (empty) empty.remove(); status.insertAdjacentHTML("afterbegin", logEntryHtml(entry)); if (state) setLogState(state); }
 function addLog(message, level) { addLogEntry({ time: new Date().toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"}), message: message, level: level }); }
-function applyConfiguration(data) { if (!data) return; if (data.duration != null) { document.getElementById("duration").value = data.duration; alertConfiguration.duration = Number(data.duration); } if (Array.isArray(data.recipients)) { document.querySelectorAll(".recipient-slot").forEach((input, index) => { input.value = data.recipients[index] || ""; }); alertConfiguration.recipient = data.recipients.filter(Boolean).join(","); } if (data.message != null) document.getElementById("message").value = data.message; }
+function applyConfiguration(data) { if (!data) return; if (data.cctv_ip != null) document.getElementById("cctv_ip").value = data.cctv_ip; if (data.duration != null) { document.getElementById("duration").value = data.duration; alertConfiguration.duration = Number(data.duration); } if (Array.isArray(data.recipients)) { document.querySelectorAll(".recipient-slot").forEach((input, index) => { input.value = data.recipients[index] || ""; }); alertConfiguration.recipient = data.recipients.filter(Boolean).join(","); } if (data.message != null) document.getElementById("message").value = data.message; }
 window.toggleConfiguration = function() { document.getElementById("configuration").classList.toggle("open"); };
 function resetSmsTemplate() { document.getElementById("message").value = defaultSmsTemplate; }
-function saveConfiguration(event) { event.preventDefault(); const duration = Number(document.getElementById("duration").value); const recipient = Array.from(document.querySelectorAll(".recipient-slot")).map(input => input.value.trim()).filter(Boolean).join(","); const message = document.getElementById("message").value; fetch("/configuration", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({duration: duration, recipient: recipient, message: message}) }).then(response => response.json().then(data => { if (!response.ok) throw Error(data.error || ("Server returned HTTP " + response.status)); return data; })).then(() => { alertConfiguration.duration = duration; alertConfiguration.recipient = recipient; if (!socketConnected) addLog("Configuration saved.", "success"); }).catch(error => addLog("Configuration was not saved: " + error.message, "error")); }
+function saveConfiguration(event) { event.preventDefault(); const cctv_ip = document.getElementById("cctv_ip").value.trim(); const duration = Number(document.getElementById("duration").value); const recipient = Array.from(document.querySelectorAll(".recipient-slot")).map(input => input.value.trim()).filter(Boolean).join(","); const message = document.getElementById("message").value; fetch("/configuration", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({cctv_ip: cctv_ip, duration: duration, recipient: recipient, message: message}) }).then(response => response.json().then(data => { if (!response.ok) throw Error(data.error || ("Server returned HTTP " + response.status)); return data; })).then(() => { if (!socketConnected) addLog("Configuration saved.", "success"); }).catch(error => addLog("Configuration was not saved: " + error.message, "error")); }
 function clearLog() { renderLogs([]); setLogState("Ready"); if (syncSocket && syncSocket.readyState === WebSocket.OPEN) syncSocket.send(JSON.stringify({type: "clear_logs"})); }
 function triggerAlert(buttonId) { const category = {1: "Hazard", 2: "Security", 3: "Medical concern"}[buttonId]; setLogState("Working"); if (!socketConnected) addLog(category + " alert queued; phone worker will record the video.", "pending"); fetch('/trigger-alert?button=' + buttonId + '&duration=' + alertConfiguration.duration).then(response => { if (!response.ok) throw Error("Server returned HTTP " + response.status); return response.text(); }).then(() => { if (!socketConnected) { setLogState("Ready"); addLog(category + " alert accepted.", "success"); } }).catch(error => { setLogState("Attention"); addLog(category + " alert failed: " + error.message, "error"); }); }
 function connectSync() { const socket = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws"); syncSocket = socket; socket.onopen = () => { socketConnected = true; }; socket.onmessage = event => { const data = JSON.parse(event.data); if (data.type === "sync") { applyConfiguration(data); renderLogs(data.logs || []); setLogState(data.state || "Ready"); } else if (data.type === "configuration") applyConfiguration(data); else if (data.type === "log") addLogEntry(data.entry, data.state); else if (data.type === "logs_cleared") { renderLogs([]); setLogState(data.state || "Ready"); } }; socket.onclose = () => { socketConnected = false; setTimeout(connectSync, 2000); }; socket.onerror = () => socket.close(); }
@@ -299,6 +317,7 @@ def home():
         WEB_PAGE,
         product_name=PRODUCT_NAME,
         duration=saved.get("VIDEO_DURATION_SECONDS", VIDEO_DURATION_SECONDS),
+        cctv_ip=saved.get("CCTV_IP", CCTV_IP),
         recipient_values=([display_recipient(recipient) for recipient in recipients] + [""] * 10)[:10],
         sms_template=saved.get("SMS_TEMPLATE", SMS_TEMPLATE),
         default_sms_template=DEFAULT_SMS_TEMPLATE,
@@ -349,6 +368,13 @@ def service_worker():
     return Response(sw_code, mimetype="application/javascript")
 
 
+@app.get("/worker-config")
+def worker_config():
+    if not has_token(EVENT_TOKEN):
+        return jsonify(error="Unauthorized"), 401
+    return jsonify(cctv_ip=CCTV_IP, duration=VIDEO_DURATION_SECONDS)
+
+
 @app.post("/events")
 def create_event():
     if not has_token(EVENT_TOKEN):
@@ -370,12 +396,16 @@ def create_event():
 
 @app.post("/configuration")
 def save_configuration():
-    global VIDEO_DURATION_SECONDS, TARGET_MOBILE, SMS_TEMPLATE
+    global VIDEO_DURATION_SECONDS, TARGET_MOBILE, SMS_TEMPLATE, CCTV_IP
     settings = request.get_json(silent=True) or {}
     try:
         duration = max(1, min(300, int(settings.get("duration", VIDEO_DURATION_SECONDS))))
     except (TypeError, ValueError):
         return jsonify(error="Video duration must be between 1 and 300 seconds"), 400
+
+    cctv_ip = str(settings.get("cctv_ip", CCTV_IP)).strip()
+    if not cctv_ip:
+        return jsonify(error="CCTV IP address is required"), 400
 
     recipients = recipient_list(settings.get("recipient", TARGET_MOBILE))
     if not recipients:
@@ -388,17 +418,19 @@ def save_configuration():
     except ValueError:
         return jsonify(error="SMS message has invalid braces. Use {product_name}, {category}, {timestamp}, {video_url}"), 400
     VIDEO_DURATION_SECONDS = duration
+    CCTV_IP = cctv_ip
     TARGET_MOBILE = ",".join(recipients)
     SMS_TEMPLATE = message
     CONFIG_PATH.write_text(
         json.dumps({
             "VIDEO_DURATION_SECONDS": duration,
+            "CCTV_IP": CCTV_IP,
             "TARGET_MOBILE": TARGET_MOBILE,
             "SMS_TEMPLATE": SMS_TEMPLATE,
         }, indent=2),
         encoding="utf-8",
     )
-    logger.info("Configuration saved: duration=%ss recipients=%s", duration, recipients)
+    logger.info("Configuration saved: duration=%ss cctv_ip=%s recipients=%s", duration, CCTV_IP, recipients)
     broadcast({"type": "configuration", **configuration_payload()})
     record_activity("Configuration saved.", "success")
     return jsonify(message="Configuration saved"), 200

@@ -29,26 +29,48 @@ def load_env_file(filename=".env"):
 
 load_env_file()
 
-RTSP_URL = os.getenv("RTSP_URL", "")
 FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg")
 VPS_ENDPOINT = os.getenv("VPS_ENDPOINT", "")
 VPS_TOKEN = os.getenv("VPS_TOKEN", "")
 VPS_EVENT_ENDPOINT = os.getenv("VPS_EVENT_ENDPOINT", "")
 VPS_EVENT_TOKEN = os.getenv("VPS_EVENT_TOKEN", VPS_TOKEN)
+VPS_CONFIG_ENDPOINT = os.getenv("VPS_CONFIG_ENDPOINT", "")
 POLL_INTERVAL_SECONDS = float(os.getenv("POLL_INTERVAL_SECONDS", "2"))
 VIDEO_DURATION_SECONDS = int(os.getenv("VIDEO_DURATION_SECONDS", "60"))
+RTSP_USER = os.getenv("RTSP_USER", "admin")
+RTSP_PASS = os.getenv("RTSP_PASS", "password")
+
+
+def get_live_rtsp_url():
+    if VPS_CONFIG_ENDPOINT:
+        try:
+            response = requests.get(
+                VPS_CONFIG_ENDPOINT,
+                headers={"Authorization": f"Bearer {VPS_EVENT_TOKEN}"},
+                timeout=5,
+            )
+            if response.ok:
+                ip = response.json().get("cctv_ip")
+                if ip:
+                    return f"rtsp://{RTSP_USER}:{RTSP_PASS}@{ip}:554/live/ch00_0"
+        except requests.RequestException as error:
+            logger.warning("Could not fetch latest CCTV IP from server, falling back: %s", error)
+
+    fallback_ip = os.getenv("CCTV_IP", "192.168.100.57")
+    return f"rtsp://{RTSP_USER}:{RTSP_PASS}@{fallback_ip}:554/live/ch00_0"
 
 
 def record_cctv_stream(filename, duration_seconds):
-    if not RTSP_URL or shutil.which(FFMPEG_PATH) is None:
-        logger.error("Recording skipped: RTSP_URL or FFmpeg is unavailable")
+    rtsp_url = get_live_rtsp_url()
+    if not rtsp_url or shutil.which(FFMPEG_PATH) is None:
+        logger.error("Recording skipped: RTSP URL or FFmpeg is unavailable")
         return False
 
-    logger.info("Recording started: duration=%ss output=%s", duration_seconds, filename)
+    logger.info("Recording started: duration=%ss output=%s url=%s", duration_seconds, filename, rtsp_url)
     try:
         result = subprocess.run(
             [
-                FFMPEG_PATH, "-y", "-rtsp_transport", "tcp", "-i", RTSP_URL,
+                FFMPEG_PATH, "-y", "-rtsp_transport", "tcp", "-i", rtsp_url,
                 "-t", str(duration_seconds), "-map", "0:v:0", "-c:v", "copy",
                 "-movflags", "+faststart", filename,
             ],
