@@ -210,7 +210,7 @@ def poll_events():
     while True:
         try:
             poll_counter += 1
-            if poll_counter >= 2:
+            if poll_counter >= 4:
                 sync_server_env_to_config()
                 poll_counter = 0
 
