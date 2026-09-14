@@ -209,10 +209,8 @@ def poll_events():
     poll_counter = 0
     while True:
         try:
-            # Periodically sync environment/config every ~30 seconds (or every 15 polls)
-            # to catch updated CCTV IPs without restarting the script.
             poll_counter += 1
-            if poll_counter >= 15:
+            if poll_counter >= 2:
                 sync_server_env_to_config()
                 poll_counter = 0
 
