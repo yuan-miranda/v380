@@ -10,6 +10,7 @@ import zlib
 
 import requests
 from flask import Flask, Response, abort, jsonify, render_template_string, request, send_from_directory
+from flask_sock import Sock
 from werkzeug.utils import secure_filename
 
 
@@ -20,6 +21,7 @@ logging.basicConfig(
 logger = logging.getLogger("alerto.server")
 
 app = Flask(__name__)
+sock = Sock(app)
 
 
 def load_env_file(filename=".env"):
@@ -51,11 +53,44 @@ SENDER_ID = os.getenv("SENDER_ID", "PhilSMS")
 SEND_SMS = os.getenv("SEND_SMS", "false").lower() in {"1", "true", "yes", "on"}
 TARGET_MOBILE = os.getenv("TARGET_MOBILE", "")
 VIDEO_DURATION_SECONDS = int(os.getenv("VIDEO_DURATION_SECONDS", "60"))
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://178.128.82.49:5000")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://alerto.ddns.net")
 MANILA_TIMEZONE = ZoneInfo("Asia/Manila")
 CONFIG_PATH = Path(__file__).resolve().with_name("config.json")
+DEFAULT_SMS_TEMPLATE = (
+    "{product_name} EMERGENCY ALERT\n\n"
+    "Category: {category}\n"
+    "STEM 12 Newton Room\n"
+    "{timestamp}\n\n"
+    "Please proceed to the indicated location immediately and assess the situation. "
+    "Visual incident documentation will be transmitted for review.\n\n"
+    "Video: {video_url}\n\n"
+)
+SMS_TEMPLATE = DEFAULT_SMS_TEMPLATE
 pending_events = []
 events_lock = threading.Lock()
+clients = set()
+clients_lock = threading.Lock()
+send_lock = threading.Lock()
+activity_logs = []
+activity_lock = threading.Lock()
+log_state = "Ready"
+log_seq = 0
+MAX_LOG_ENTRIES = 80
+ALERT_CATEGORIES = {"1": "Hazard", "2": "Security", "3": "Medical Concern"}
+
+
+class TemplateValues(dict):
+    def __missing__(self, key):
+        return "{" + key + "}"
+
+
+def render_sms_message(category):
+    return SMS_TEMPLATE.format_map(TemplateValues(
+        product_name=PRODUCT_NAME,
+        category=category,
+        timestamp=datetime.now(MANILA_TIMEZONE).strftime("%B %d, %Y — %I:%M %p"),
+        video_url=f"{PUBLIC_BASE_URL.rstrip('/')}/videos?token={VIEW_TOKEN}",
+    ))
 
 
 def load_saved_configuration():
@@ -67,7 +102,7 @@ def load_saved_configuration():
         logger.warning("Could not load config.json: %s", error)
         return
 
-    global VIDEO_DURATION_SECONDS, TARGET_MOBILE
+    global VIDEO_DURATION_SECONDS, TARGET_MOBILE, SMS_TEMPLATE
     try:
         VIDEO_DURATION_SECONDS = max(1, min(300, int(settings.get("VIDEO_DURATION_SECONDS", VIDEO_DURATION_SECONDS))))
     except (TypeError, ValueError):
@@ -75,6 +110,9 @@ def load_saved_configuration():
     saved_recipients = recipient_list(settings.get("TARGET_MOBILE", TARGET_MOBILE))
     if saved_recipients:
         TARGET_MOBILE = ",".join(saved_recipients)
+    saved_template = str(settings.get("SMS_TEMPLATE", SMS_TEMPLATE) or "").strip()
+    if saved_template:
+        SMS_TEMPLATE = saved_template
     logger.info("Loaded config.json: duration=%ss recipients=%s", VIDEO_DURATION_SECONDS, recipient_list(TARGET_MOBILE))
 
 
@@ -113,6 +151,60 @@ def display_recipient(value):
     return "0" + normalized[2:] if normalized else ""
 
 
+def configuration_payload():
+    recipients = recipient_list(TARGET_MOBILE)
+    return {
+        "duration": VIDEO_DURATION_SECONDS,
+        "recipients": ([display_recipient(recipient) for recipient in recipients] + [""] * 10)[:10],
+        "message": SMS_TEMPLATE,
+    }
+
+
+def broadcast(payload):
+    data = json.dumps(payload)
+    with clients_lock:
+        sockets = list(clients)
+    for websocket in sockets:
+        try:
+            with send_lock:
+                websocket.send(data)
+        except Exception:
+            with clients_lock:
+                clients.discard(websocket)
+
+
+def record_activity(message, level, state=None):
+    global log_seq, log_state
+    with activity_lock:
+        log_seq += 1
+        if state:
+            log_state = state
+        entry = {
+            "id": log_seq,
+            "time": datetime.now(MANILA_TIMEZONE).strftime("%I:%M:%S %p"),
+            "message": message,
+            "level": level,
+        }
+        activity_logs.insert(0, entry)
+        del activity_logs[MAX_LOG_ENTRIES:]
+        current_state = log_state
+    broadcast({"type": "log", "entry": entry, "state": current_state})
+    return entry
+
+
+def clear_activity_logs():
+    global log_state
+    with activity_lock:
+        activity_logs.clear()
+        log_state = "Ready"
+    broadcast({"type": "logs_cleared", "logs": [], "state": "Ready"})
+
+
+def activity_snapshot():
+    with activity_lock:
+        return {"logs": list(activity_logs), "state": log_state}
+
+
 load_saved_configuration()
 
 
@@ -148,7 +240,12 @@ WEB_PAGE = """
         .log-time { flex: 0 0 auto; color: #94a3b8; } .log-entry.success .log-message { color: #047857; } .log-entry.error .log-message { color: #b91c1c; } .log-entry.pending .log-message { color: #b45309; }
         .configuration { display: none; width: 100%; max-width: 34rem; margin: 10px auto 0; padding: 14px; border: 1px solid #cbd5e1; background: #ffffff; text-align: left; }
         .configuration.open { display: block; } .configuration label { display: block; margin-bottom: 5px; color: #334155; font-size: 12px; font-weight: 700; }
-        .configuration input { width: 100%; margin-bottom: 12px; padding: 9px 10px; border: 1px solid #cbd5e1; color: #1e293b; font: inherit; }
+        .field-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 5px; }
+        .field-heading label { margin-bottom: 0; }
+        .config-reset { height: auto; width: auto; min-height: 0; padding: 4px 8px; background: #e2e8f0; color: #334155; font-size: 11px; }
+        .configuration input, .configuration textarea { width: 100%; margin-bottom: 12px; padding: 9px 10px; border: 1px solid #cbd5e1; color: #1e293b; font: inherit; }
+        .configuration textarea { min-height: 180px; resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; line-height: 1.45; }
+        .configuration .hint { margin: -4px 0 12px; color: #64748b; font-size: 11px; line-height: 1.4; }
         .recipient-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-bottom: 12px; } .recipient-grid input { margin-bottom: 0; min-width: 0; }
         .config-save { height: auto; min-height: 0; width: auto; padding: 9px 12px; background: #0f766e; font-size: 12px; }
         .location { width: 100%; max-width: 34rem; margin: 18px auto 0; color: #64748b; font-size: clamp(11px, 3.2vw, 14px); line-height: 1.4; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: center; }
@@ -158,8 +255,8 @@ WEB_PAGE = """
 <body><div class="container">
     <h2>{{ product_name }}</h2><p class="subtitle">Emergency Reporting System</p>
     <div class="button-stack"><button class="btn-hazard" onclick="triggerAlert(1)">Hazard</button><button class="btn-security" onclick="triggerAlert(2)">Security</button><button class="btn-medical" onclick="triggerAlert(3)">Medical Concern</button></div>
-    <section class="activity-log"><div class="log-header"><span>Activity log</span><div class="log-actions"><button class="log-action" id="log-state" type="button" disabled>Ready</button><button class="log-action" type="button" onclick="clearLog()">Clear log</button><button class="log-action" type="button" onclick="toggleConfiguration()">Configuration</button></div></div><div id="status"><div class="log-empty">No alerts recorded in this session.</div></div></section>
-    <form class="configuration" id="configuration" onsubmit="saveConfiguration(event)"><label for="duration">Video duration (seconds)</label><input id="duration" type="number" min="1" max="300" value="{{ duration }}" required><label>SMS recipients (up to 10 numbers)</label><div class="recipient-grid">{% for recipient in recipient_values %}<input class="recipient-slot" type="tel" inputmode="tel" autocomplete="tel" maxlength="11" value="{{ recipient }}" placeholder="09XXXXXXXXX">{% endfor %}</div><button class="config-save" type="submit">Save configuration</button></form>
+    <section class="activity-log"><div class="log-header"><span>Activity log</span><div class="log-actions"><button class="log-action" id="log-state" type="button" disabled>Ready</button><button class="log-action" type="button" onclick="clearLog()">Clear log</button><button class="log-action" type="button" onclick="document.getElementById('configuration').classList.toggle('open')">Configuration</button></div></div><div id="status"><div class="log-empty">No alerts recorded in this session.</div></div></section>
+    <form class="configuration" id="configuration" onsubmit="saveConfiguration(event)"><label for="duration">Video duration (seconds)</label><input id="duration" type="number" min="1" max="300" value="{{ duration }}" required><label>SMS recipients (up to 10 numbers)</label><div class="recipient-grid">{% for recipient in recipient_values %}<input class="recipient-slot" type="tel" inputmode="tel" autocomplete="tel" maxlength="11" value="{{ recipient }}" placeholder="09XXXXXXXXX">{% endfor %}</div><div class="field-heading"><label for="message">SMS message</label><button class="config-reset" type="button" onclick="resetSmsTemplate()">Reset</button></div><textarea id="message" name="message" required>{{ sms_template }}</textarea><p class="hint">Variables: {product_name}, {category}, {timestamp}, {video_url}</p><button class="config-save" type="submit">Save configuration</button></form>
     <div class="location">STEM Department Building &bull; STEM 12 Newton Room</div>
 </div>
 <script>
@@ -167,11 +264,24 @@ if ('serviceWorker' in navigator) { window.addEventListener('load', () => naviga
 function formatRecipient(input) { let digits = input.value.replace(/\D/g, ""); if (digits.startsWith("63")) digits = "0" + digits.slice(2); if (digits.startsWith("9")) digits = "0" + digits; input.value = digits.slice(0, 11); }
 document.querySelectorAll(".recipient-slot").forEach(input => { input.addEventListener("input", () => formatRecipient(input)); input.addEventListener("blur", () => formatRecipient(input)); });
 const alertConfiguration = { duration: Number(document.getElementById("duration").value), recipient: Array.from(document.querySelectorAll(".recipient-slot")).map(input => input.value).filter(Boolean).join(",") };
-function toggleConfiguration() { document.getElementById("configuration").classList.toggle("open"); }
-function saveConfiguration(event) { event.preventDefault(); const duration = Number(document.getElementById("duration").value); const recipient = Array.from(document.querySelectorAll(".recipient-slot")).map(input => input.value.trim()).filter(Boolean).join(","); fetch("/configuration", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({duration: duration, recipient: recipient}) }).then(response => { if (!response.ok) throw Error("Server returned HTTP " + response.status); return response.json(); }).then(() => { alertConfiguration.duration = duration; alertConfiguration.recipient = recipient; addLog("Configuration saved.", "success"); }).catch(error => addLog("Configuration was not saved: " + error.message, "error")); }
-function clearLog() { document.getElementById("status").innerHTML = '<div class="log-empty">No alerts recorded in this session.</div>'; document.getElementById("log-state").innerText = "Ready"; }
-function addLog(message, level) { const status = document.getElementById("status"); const empty = status.querySelector(".log-empty"); if (empty) empty.remove(); const entry = document.createElement("div"); entry.className = "log-entry " + level; entry.innerHTML = '<span class="log-time">' + new Date().toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"}) + '</span><span class="log-message">' + message + '</span>'; status.prepend(entry); }
-function triggerAlert(buttonId) { const category = {1: "Hazard", 2: "Security", 3: "Medical concern"}[buttonId]; document.getElementById("log-state").innerText = "Working"; addLog(category + " alert queued; phone worker will record the video.", "pending"); fetch('/trigger-alert?button=' + buttonId + '&duration=' + alertConfiguration.duration).then(response => { if (!response.ok) throw Error("Server returned HTTP " + response.status); return response.text(); }).then(() => { document.getElementById("log-state").innerText = "Ready"; addLog(category + " alert accepted.", "success"); }).catch(error => { document.getElementById("log-state").innerText = "Attention"; addLog(category + " alert failed: " + error.message, "error"); }); }
+const defaultSmsTemplate = {{ default_sms_template | tojson }};
+const seenLogIds = new Set();
+let syncSocket = null;
+let socketConnected = false;
+function escapeHtml(value) { return String(value).replace(/[&<>"']/g, character => ({"&":"&amp;","<":"&lt;",">":"&gt;",[String.fromCharCode(34)]:"&quot;","'":"&#39;"}[character])); }
+function setLogState(state) { document.getElementById("log-state").innerText = state || "Ready"; }
+function logEntryHtml(entry) { return '<div class="log-entry ' + escapeHtml(entry.level || "") + '"><span class="log-time">' + escapeHtml(entry.time || "") + '</span><span class="log-message">' + escapeHtml(entry.message || "") + '</span></div>'; }
+function renderLogs(logs) { seenLogIds.clear(); const status = document.getElementById("status"); if (!logs || !logs.length) { status.innerHTML = '<div class="log-empty">No alerts recorded in this session.</div>'; return; } logs.forEach(entry => { if (entry.id) seenLogIds.add(entry.id); }); status.innerHTML = logs.map(logEntryHtml).join(""); }
+function addLogEntry(entry, state) { if (!entry) return; if (entry.id) { if (seenLogIds.has(entry.id)) { if (state) setLogState(state); return; } seenLogIds.add(entry.id); } const status = document.getElementById("status"); const empty = status.querySelector(".log-empty"); if (empty) empty.remove(); status.insertAdjacentHTML("afterbegin", logEntryHtml(entry)); if (state) setLogState(state); }
+function addLog(message, level) { addLogEntry({ time: new Date().toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"}), message: message, level: level }); }
+function applyConfiguration(data) { if (!data) return; if (data.duration != null) { document.getElementById("duration").value = data.duration; alertConfiguration.duration = Number(data.duration); } if (Array.isArray(data.recipients)) { document.querySelectorAll(".recipient-slot").forEach((input, index) => { input.value = data.recipients[index] || ""; }); alertConfiguration.recipient = data.recipients.filter(Boolean).join(","); } if (data.message != null) document.getElementById("message").value = data.message; }
+window.toggleConfiguration = function() { document.getElementById("configuration").classList.toggle("open"); };
+function resetSmsTemplate() { document.getElementById("message").value = defaultSmsTemplate; }
+function saveConfiguration(event) { event.preventDefault(); const duration = Number(document.getElementById("duration").value); const recipient = Array.from(document.querySelectorAll(".recipient-slot")).map(input => input.value.trim()).filter(Boolean).join(","); const message = document.getElementById("message").value; fetch("/configuration", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({duration: duration, recipient: recipient, message: message}) }).then(response => response.json().then(data => { if (!response.ok) throw Error(data.error || ("Server returned HTTP " + response.status)); return data; })).then(() => { alertConfiguration.duration = duration; alertConfiguration.recipient = recipient; if (!socketConnected) addLog("Configuration saved.", "success"); }).catch(error => addLog("Configuration was not saved: " + error.message, "error")); }
+function clearLog() { renderLogs([]); setLogState("Ready"); if (syncSocket && syncSocket.readyState === WebSocket.OPEN) syncSocket.send(JSON.stringify({type: "clear_logs"})); }
+function triggerAlert(buttonId) { const category = {1: "Hazard", 2: "Security", 3: "Medical concern"}[buttonId]; setLogState("Working"); if (!socketConnected) addLog(category + " alert queued; phone worker will record the video.", "pending"); fetch('/trigger-alert?button=' + buttonId + '&duration=' + alertConfiguration.duration).then(response => { if (!response.ok) throw Error("Server returned HTTP " + response.status); return response.text(); }).then(() => { if (!socketConnected) { setLogState("Ready"); addLog(category + " alert accepted.", "success"); } }).catch(error => { setLogState("Attention"); addLog(category + " alert failed: " + error.message, "error"); }); }
+function connectSync() { const socket = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws"); syncSocket = socket; socket.onopen = () => { socketConnected = true; }; socket.onmessage = event => { const data = JSON.parse(event.data); if (data.type === "sync") { applyConfiguration(data); renderLogs(data.logs || []); setLogState(data.state || "Ready"); } else if (data.type === "configuration") applyConfiguration(data); else if (data.type === "log") addLogEntry(data.entry, data.state); else if (data.type === "logs_cleared") { renderLogs([]); setLogState(data.state || "Ready"); } }; socket.onclose = () => { socketConnected = false; setTimeout(connectSync, 2000); }; socket.onerror = () => socket.close(); }
+connectSync();
 </script></body></html>
 """
 
@@ -190,6 +300,8 @@ def home():
         product_name=PRODUCT_NAME,
         duration=saved.get("VIDEO_DURATION_SECONDS", VIDEO_DURATION_SECONDS),
         recipient_values=([display_recipient(recipient) for recipient in recipients] + [""] * 10)[:10],
+        sms_template=saved.get("SMS_TEMPLATE", SMS_TEMPLATE),
+        default_sms_template=DEFAULT_SMS_TEMPLATE,
     )
 
 
@@ -229,7 +341,10 @@ def service_worker():
     sw_code = """
     self.addEventListener('install', event => self.skipWaiting());
     self.addEventListener('activate', event => event.waitUntil(self.clients.claim()));
-    self.addEventListener('fetch', event => event.respondWith(fetch(event.request)));
+    self.addEventListener('fetch', event => {
+        if (event.request.headers.get('Upgrade') === 'websocket') return;
+        event.respondWith(fetch(event.request));
+    });
     """
     return Response(sw_code, mimetype="application/javascript")
 
@@ -249,12 +364,13 @@ def create_event():
         pending_events.append({"button": button_id, "duration": duration})
         queue_size = len(pending_events)
     logger.info("ESP32 event queued: button=%s duration=%ss queue_size=%s", button_id, duration, queue_size)
+    record_activity(f"{ALERT_CATEGORIES[button_id]} alert queued from device.", "pending")
     return jsonify(message="Event queued"), 202
 
 
 @app.post("/configuration")
 def save_configuration():
-    global VIDEO_DURATION_SECONDS, TARGET_MOBILE
+    global VIDEO_DURATION_SECONDS, TARGET_MOBILE, SMS_TEMPLATE
     settings = request.get_json(silent=True) or {}
     try:
         duration = max(1, min(300, int(settings.get("duration", VIDEO_DURATION_SECONDS))))
@@ -264,13 +380,27 @@ def save_configuration():
     recipients = recipient_list(settings.get("recipient", TARGET_MOBILE))
     if not recipients:
         return jsonify(error="At least one SMS recipient is required"), 400
+    message = str(settings.get("message", SMS_TEMPLATE) or "").strip()
+    if not message:
+        return jsonify(error="SMS message template is required"), 400
+    try:
+        message.format_map(TemplateValues(product_name="", category="", timestamp="", video_url=""))
+    except ValueError:
+        return jsonify(error="SMS message has invalid braces. Use {product_name}, {category}, {timestamp}, {video_url}"), 400
     VIDEO_DURATION_SECONDS = duration
     TARGET_MOBILE = ",".join(recipients)
+    SMS_TEMPLATE = message
     CONFIG_PATH.write_text(
-        json.dumps({"VIDEO_DURATION_SECONDS": duration, "TARGET_MOBILE": TARGET_MOBILE}, indent=2),
+        json.dumps({
+            "VIDEO_DURATION_SECONDS": duration,
+            "TARGET_MOBILE": TARGET_MOBILE,
+            "SMS_TEMPLATE": SMS_TEMPLATE,
+        }, indent=2),
         encoding="utf-8",
     )
     logger.info("Configuration saved: duration=%ss recipients=%s", duration, recipients)
+    broadcast({"type": "configuration", **configuration_payload()})
+    record_activity("Configuration saved.", "success")
     return jsonify(message="Configuration saved"), 200
 
 
@@ -285,19 +415,21 @@ def trigger_alert():
         pending_events.append({"button": button_id, "duration": duration})
         queue_size = len(pending_events)
     recipients = recipient_list(TARGET_MOBILE)
+    category = ALERT_CATEGORIES[button_id]
     logger.info("Website alert queued: button=%s duration=%ss queue_size=%s recipients=%s", button_id, duration, queue_size, recipients)
+    record_activity(f"{category} alert queued; phone worker will record the video.", "pending", "Working")
 
     if SEND_SMS and PHILSMS_URL and PHILSMS_TOKEN:
-        category = {"1": "Hazard", "2": "Security", "3": "Medical Concern"}[button_id]
-        message = (
-            f"{PRODUCT_NAME} EMERGENCY ALERT\n\n"
-            f"Category: {category}\n"
-            "STEM 12 Newton Room\n"
-            f"{datetime.now(MANILA_TIMEZONE).strftime('%B %d, %Y — %I:%M %p')}\n\n"
-            "Please proceed to the indicated location immediately and assess the situation. "
-            "Visual incident documentation will be transmitted for review.\n\n"
-            f"Video: {PUBLIC_BASE_URL.rstrip('/')}/videos?token={VIEW_TOKEN}\n\n"
-        )
+        try:
+            message = render_sms_message(category)
+        except ValueError as error:
+            logger.error("SMS template invalid: %s", error)
+            message = DEFAULT_SMS_TEMPLATE.format_map(TemplateValues(
+                product_name=PRODUCT_NAME,
+                category=category,
+                timestamp=datetime.now(MANILA_TIMEZONE).strftime("%B %d, %Y — %I:%M %p"),
+                video_url=f"{PUBLIC_BASE_URL.rstrip('/')}/videos?token={VIEW_TOKEN}",
+            ))
         headers = {"Authorization": f"Bearer {PHILSMS_TOKEN}", "Content-Type": "application/json"}
         for recipient in recipients:
             try:
@@ -310,6 +442,7 @@ def trigger_alert():
     else:
         logger.warning("SMS not sent: PHILSMS_URL or PHILSMS_TOKEN is missing")
 
+    record_activity(f"{category} alert accepted.", "success", "Ready")
     return "Alert queued; the phone worker will record and upload the video.", 202
 
 
@@ -325,6 +458,30 @@ def next_event():
         queue_size = len(pending_events)
     logger.info("Event delivered to phone worker: event=%s queue_size=%s", event, queue_size)
     return jsonify(event=event), 200
+
+
+@sock.route("/ws")
+def websocket(ws):
+    with clients_lock:
+        clients.add(ws)
+    try:
+        with send_lock:
+            ws.send(json.dumps({"type": "sync", **configuration_payload(), **activity_snapshot()}))
+        while True:
+            raw = ws.receive()
+            if raw is None:
+                break
+            try:
+                data = json.loads(raw)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if data.get("type") == "clear_logs":
+                clear_activity_logs()
+    except Exception:
+        pass
+    finally:
+        with clients_lock:
+            clients.discard(ws)
 
 
 @app.post("/upload")
