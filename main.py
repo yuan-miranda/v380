@@ -184,10 +184,17 @@ def process_event(event):
         duration = max(1, min(300, int(event.get("duration", VIDEO_DURATION_SECONDS))))
     except (TypeError, ValueError):
         duration = VIDEO_DURATION_SECONDS
-    filename = os.path.abspath(
-        f"evidence_btn{button_id}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.mp4"
-    )
-    logger.info("Event received: button=%s duration=%ss", button_id, duration)
+
+    # Prioritize server-provided filename to completely avoid mismatch issues
+    server_filename = event.get("filename")
+    if server_filename:
+        filename = os.path.abspath(server_filename)
+    else:
+        filename = os.path.abspath(
+            f"evidence_btn{button_id}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.mp4"
+        )
+
+    logger.info("Event received: button=%s duration=%ss filename=%s", button_id, duration, os.path.basename(filename))
     if record_cctv_stream(filename, duration):
         upload_video(filename)
     else:

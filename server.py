@@ -92,30 +92,39 @@ class TemplateValues(dict):
         return "{" + key + "}"
 
 
-def render_sms_message(category):
+def render_sms_message(category, video_filename=""):
+    if not video_filename:
+        now_str = datetime.now(MANILA_TIMEZONE).strftime("%Y-%m-%d_%H-%M-%S")
+        btn_map = {"Hazard": "1", "Security": "2", "Medical Concern": "3"}
+        b_id = btn_map.get(category, "2")
+        video_filename = f"evidence_btn{b_id}_{now_str}.mp4"
+
+    video_url = f"{PUBLIC_BASE_URL.rstrip('/')}/videos/{video_filename}?token={VIEW_TOKEN}"
     return SMS_TEMPLATE.format_map(
         TemplateValues(
             product_name=PRODUCT_NAME,
             category=category,
             timestamp=datetime.now(MANILA_TIMEZONE).strftime("%B %d, %Y — %I:%M %p"),
-            video_url=f"{PUBLIC_BASE_URL.rstrip('/')}/videos?token={VIEW_TOKEN}",
+            video_url=video_url,
         )
     )
 
 
-def send_sms_notification(button_id):
+def send_sms_notification(button_id, video_filename=""):
     category = ALERT_CATEGORIES.get(button_id, "Hazard")
     recipients = recipient_list(TARGET_MOBILE)
     if SEND_SMS and PHILSMS_URL and PHILSMS_TOKEN:
         try:
-            message = render_sms_message(category)
+            message = render_sms_message(category, video_filename)
         except ValueError:
+            now_str = datetime.now(MANILA_TIMEZONE).strftime("%Y-%m-%d_%H-%M-%S")
+            fallback_video_url = f"{PUBLIC_BASE_URL.rstrip('/')}/videos/evidence_btn{button_id}_{now_str}.mp4?token={VIEW_TOKEN}"
             message = DEFAULT_SMS_TEMPLATE.format_map(
                 TemplateValues(
                     product_name=PRODUCT_NAME,
                     category=category,
                     timestamp=datetime.now(MANILA_TIMEZONE).strftime("%B %d, %Y — %I:%M %p"),
-                    video_url=f"{PUBLIC_BASE_URL.rstrip('/')}/videos?token={VIEW_TOKEN}"
+                    video_url=fallback_video_url
                 )
             )
         headers = {"Authorization": f"Bearer {PHILSMS_TOKEN}", "Content-Type": "application/json"}
@@ -351,7 +360,6 @@ WEB_PAGE = """
 <script>
 if ('serviceWorker' in navigator) { window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js')); }
 
-// Native browser prompt password check
 if (sessionStorage.getItem("alerto_unlocked") !== "true") {
     let password = prompt("Enter security password:");
     if (password === "alerto") {
@@ -502,20 +510,29 @@ def create_event():
         return jsonify(error="button must be 1, 2, or 3"), 400
 
     duration = max(1, min(300, int(data.get("duration", VIDEO_DURATION_SECONDS))))
+    
+    # Pre-calculate filename based on server click time
+    now_str = datetime.now(MANILA_TIMEZONE).strftime("%Y-%m-%d_%H-%M-%S")
+    video_filename = f"evidence_btn{button_id}_{now_str}.mp4"
+
     with events_lock:
-        pending_events.append({"button": button_id, "duration": duration})
+        pending_events.append({"button": button_id, "duration": duration, "filename": video_filename})
         queue_size = len(pending_events)
+        
     logger.info(
-        "ESP32 event queued: button=%s duration=%ss queue_size=%s",
+        "ESP32 event queued: button=%s duration=%ss filename=%s queue_size=%s",
         button_id,
         duration,
+        video_filename,
         queue_size,
     )
     category_name = ALERT_CATEGORIES[button_id]
     record_activity(
         f"[HARDWARE_SIGNAL] Received {category_name} event from ESP32 device node. Added to recording pipeline queue.", "pending"
     )
-    send_sms_notification(button_id)
+    
+    send_sms_notification(button_id, video_filename)
+    
     record_activity(
         f"[ALERT_DISPATCHED] {category_name} hardware event processed. SMS notifications broadcasted successfully.", "success"
     )
@@ -590,15 +607,22 @@ def trigger_alert():
     duration = max(
         1, min(300, int(request.args.get("duration", VIDEO_DURATION_SECONDS)))
     )
+    
+    # Pre-calculate filename based on web console click time
+    now_str = datetime.now(MANILA_TIMEZONE).strftime("%Y-%m-%d_%H-%M-%S")
+    video_filename = f"evidence_btn{button_id}_{now_str}.mp4"
+
     with events_lock:
-        pending_events.append({"button": button_id, "duration": duration})
+        pending_events.append({"button": button_id, "duration": duration, "filename": video_filename})
         queue_size = len(pending_events)
+        
     recipients = recipient_list(TARGET_MOBILE)
     category = ALERT_CATEGORIES[button_id]
     logger.info(
-        "Website alert queued: button=%s duration=%ss queue_size=%s recipients=%s",
+        "Website alert queued: button=%s duration=%ss filename=%s queue_size=%s recipients=%s",
         button_id,
         duration,
+        video_filename,
         queue_size,
         recipients,
     )
@@ -608,7 +632,7 @@ def trigger_alert():
         "Working",
     )
 
-    send_sms_notification(button_id)
+    send_sms_notification(button_id, video_filename)
 
     record_activity(f"[ALERT_SUCCESS] {category} alert sequence accepted. Emergency protocols initiated.", "success", "Ready")
     return "Alert queued; the phone worker will record and upload the video.", 202
