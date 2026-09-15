@@ -324,30 +324,44 @@ WEB_PAGE = """
         .recipient-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-bottom: 12px; } .recipient-grid input { margin-bottom: 0; min-width: 0; }
         .config-save { height: auto; min-height: 0; width: auto; padding: 9px 12px; background: #0f766e; font-size: 12px; }
         .location { width: 100%; max-width: 34rem; margin: 18px auto 0; color: #64748b; font-size: clamp(11px, 3.2vw, 14px); line-height: 1.4; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: center; }
+
         @media (min-width: 700px) { .container { padding: 48px; } .button-stack { gap: 18px; } button { height: 220px; } }
     </style>
 </head>
-<body><div class="container">
-    <h2>{{ product_name }}</h2><p class="subtitle">Emergency Reporting System</p>
-    <div class="button-stack"><button class="btn-hazard" onclick="triggerAlert(1)">Hazard</button><button class="btn-security" onclick="triggerAlert(2)">Security</button><button class="btn-medical" onclick="triggerAlert(3)">Medical Concern</button></div>
-    <section class="activity-log"><div class="log-header"><span>Activity log</span><div class="log-actions"><button class="log-action" id="log-state" type="button" disabled>Ready</button><button class="log-action" type="button" onclick="clearLog()">Clear log</button><button class="log-action" type="button" onclick="document.getElementById('configuration').classList.toggle('open')">Configuration</button></div></div><div id="status"><div class="log-empty">No alerts recorded in this session.</div></div></section>
-    <form class="configuration" id="configuration" onsubmit="saveConfiguration(event)">
-        <label for="cctv_ip">CCTV IP Address</label>
-        <input id="cctv_ip" type="text" value="{{ cctv_ip }}" required>
-        <label for="duration">Video duration (seconds)</label>
-        <input id="duration" type="number" min="1" max="300" value="{{ duration }}" required>
-        <label>SMS recipients (up to 10 numbers)</label>
-        <p class="hint">Note: PhilSMS is not supported for SMART simcard subscribers.</p>        
-        <div class="recipient-grid">{% for recipient in recipient_values %}<input class="recipient-slot" type="tel" inputmode="tel" autocomplete="tel" maxlength="11" value="{{ recipient }}" placeholder="09XXXXXXXXX">{% endfor %}</div>
-        <div class="field-heading"><label for="message">SMS message</label><button class="config-reset" type="button" onclick="resetSmsTemplate()">Reset</button></div>
-        <textarea id="message" name="message" required>{{ sms_template }}</textarea>
-        <p class="hint">Variables: {product_name}, {category}, {timestamp}, {video_url}</p>
-        <button class="config-save" type="submit">Save configuration</button>
-    </form>
-    <div class="location">STEM Department Building &bull; STEM 12 Newton Room</div>
-</div>
+<body>
+    <div class="container">
+        <h2>{{ product_name }}</h2><p class="subtitle">Emergency Reporting System</p>
+        <div class="button-stack"><button class="btn-hazard" onclick="triggerAlert(1)">Hazard</button><button class="btn-security" onclick="triggerAlert(2)">Security</button><button class="btn-medical" onclick="triggerAlert(3)">Medical Concern</button></div>
+        <section class="activity-log"><div class="log-header"><span>Activity log</span><div class="log-actions"><button class="log-action" id="log-state" type="button" disabled>Ready</button><button class="log-action" type="button" onclick="clearLog()">Clear log</button><button class="log-action" type="button" onclick="document.getElementById('configuration').classList.toggle('open')">Configuration</button></div></div><div id="status"><div class="log-empty">No alerts recorded in this session.</div></div></section>
+        <form class="configuration" id="configuration" onsubmit="saveConfiguration(event)">
+            <label for="cctv_ip">CCTV IP Address</label>
+            <input id="cctv_ip" type="text" value="{{ cctv_ip }}" required>
+            <label for="duration">Video duration (seconds)</label>
+            <input id="duration" type="number" min="1" max="300" value="{{ duration }}" required>
+            <label>SMS recipients (up to 10 numbers)</label>
+            <p class="hint">Note: PhilSMS is not supported for SMART simcard subscribers.</p>        
+            <div class="recipient-grid">{% for recipient in recipient_values %}<input class="recipient-slot" type="tel" inputmode="tel" autocomplete="tel" maxlength="11" value="{{ recipient }}" placeholder="09XXXXXXXXX">{% endfor %}</div>
+            <div class="field-heading"><label for="message">SMS message</label><button class="config-reset" type="button" onclick="resetSmsTemplate()">Reset</button></div>
+            <textarea id="message" name="message" required>{{ sms_template }}</textarea>
+            <p class="hint">Variables: {product_name}, {category}, {timestamp}, {video_url}</p>
+            <button class="config-save" type="submit">Save configuration</button>
+        </form>
+        <div class="location">STEM Department Building &bull; STEM 12 Newton Room</div>
+    </div>
 <script>
 if ('serviceWorker' in navigator) { window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js')); }
+
+// Native browser prompt password check
+if (sessionStorage.getItem("alerto_unlocked") !== "true") {
+    let password = prompt("Enter security password:");
+    if (password === "alerto") {
+        sessionStorage.setItem("alerto_unlocked", "true");
+    } else {
+        alert("Incorrect password.");
+        location.reload();
+    }
+}
+
 function formatRecipient(input) { let digits = input.value.replace(/\D/g, ""); if (digits.startsWith("63")) digits = "0" + digits.slice(2); if (digits.startsWith("9")) digits = "0" + digits; input.value = digits.slice(0, 11); }
 document.querySelectorAll(".recipient-slot").forEach(input => { input.addEventListener("input", () => formatRecipient(input)); input.addEventListener("blur", () => formatRecipient(input)); });
 const alertConfiguration = { duration: Number(document.getElementById("duration").value), recipient: Array.from(document.querySelectorAll(".recipient-slot")).map(input => input.value).filter(Boolean).join(",") };
