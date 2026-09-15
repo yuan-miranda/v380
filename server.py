@@ -296,7 +296,8 @@ WEB_PAGE = """
     <style>
         :root { color-scheme: light; }
         * { box-sizing: border-box; }
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; text-align: center; margin: 0; min-height: 100dvh; background: #e2e8f0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; text-align: center; margin: 0; min-height: 100dvh; background: #e2e8f0; user-select: none; -webkit-user-select: none; }
+        input, textarea { user-select: text; -webkit-user-select: text; }
         .container { background: #f8fafc; min-height: 100dvh; width: 100%; padding: max(32px, env(safe-area-inset-top)) max(20px, env(safe-area-inset-right)) max(28px, env(safe-area-inset-bottom)) max(20px, env(safe-area-inset-left)); display: flex; flex-direction: column; justify-content: center; align-items: center; overflow: hidden; }
         h2 { color: #0f172a; margin: 0 0 8px; font-family: Georgia, "Times New Roman", serif; font-size: clamp(28px, 7vw, 38px); font-weight: 700; line-height: 1.1; }
         .subtitle { color: #64748b; margin: 0 0 30px; font-size: 14px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; }
@@ -336,6 +337,7 @@ WEB_PAGE = """
         <label for="duration">Video duration (seconds)</label>
         <input id="duration" type="number" min="1" max="300" value="{{ duration }}" required>
         <label>SMS recipients (up to 10 numbers)</label>
+        <p class="hint">Note: PhilSMS is not supported for SMART simcard subscribers.</p>        
         <div class="recipient-grid">{% for recipient in recipient_values %}<input class="recipient-slot" type="tel" inputmode="tel" autocomplete="tel" maxlength="11" value="{{ recipient }}" placeholder="09XXXXXXXXX">{% endfor %}</div>
         <div class="field-heading"><label for="message">SMS message</label><button class="config-reset" type="button" onclick="resetSmsTemplate()">Reset</button></div>
         <textarea id="message" name="message" required>{{ sms_template }}</textarea>
@@ -362,9 +364,9 @@ function addLog(message, level) { addLogEntry({ time: new Date().toLocaleTimeStr
 function applyConfiguration(data) { if (!data) return; if (data.cctv_ip != null) document.getElementById("cctv_ip").value = data.cctv_ip; if (data.duration != null) { document.getElementById("duration").value = data.duration; alertConfiguration.duration = Number(data.duration); } if (Array.isArray(data.recipients)) { document.querySelectorAll(".recipient-slot").forEach((input, index) => { input.value = data.recipients[index] || ""; }); alertConfiguration.recipient = data.recipients.filter(Boolean).join(","); } if (data.message != null) document.getElementById("message").value = data.message; }
 window.toggleConfiguration = function() { document.getElementById("configuration").classList.toggle("open"); };
 function resetSmsTemplate() { document.getElementById("message").value = defaultSmsTemplate; }
-function saveConfiguration(event) { event.preventDefault(); const cctv_ip = document.getElementById("cctv_ip").value.trim(); const duration = Number(document.getElementById("duration").value); const recipient = Array.from(document.querySelectorAll(".recipient-slot")).map(input => input.value.trim()).filter(Boolean).join(","); const message = document.getElementById("message").value; fetch("/configuration", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({cctv_ip: cctv_ip, duration: duration, recipient: recipient, message: message}) }).then(response => response.json().then(data => { if (!response.ok) throw Error(data.error || ("Server returned HTTP " + response.status)); return data; })).then(() => { if (!socketConnected) addLog("Configuration saved.", "success"); }).catch(error => addLog("Configuration was not saved: " + error.message, "error")); }
+function saveConfiguration(event) { event.preventDefault(); const cctv_ip = document.getElementById("cctv_ip").value.trim(); const duration = Number(document.getElementById("duration").value); const recipient = Array.from(document.querySelectorAll(".recipient-slot")).map(input => input.value.trim()).filter(Boolean).join(","); const message = document.getElementById("message").value; fetch("/configuration", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({cctv_ip: cctv_ip, duration: duration, recipient: recipient, message: message}) }).then(response => response.json().then(data => { if (!response.ok) throw Error(data.error || ("Server returned HTTP " + response.status)); return data; })).then(() => { if (!socketConnected) addLog("[CONFIG] System settings updated successfully.", "success"); }).catch(error => addLog("[CONFIG_ERROR] Failed to save configuration: " + error.message, "error")); }
 function clearLog() { renderLogs([]); setLogState("Ready"); if (syncSocket && syncSocket.readyState === WebSocket.OPEN) syncSocket.send(JSON.stringify({type: "clear_logs"})); }
-function triggerAlert(buttonId) { const category = {1: "Hazard", 2: "Security", 3: "Medical concern"}[buttonId]; setLogState("Working"); if (!socketConnected) addLog(category + " alert queued; phone worker will record the video.", "pending"); fetch('/trigger-alert?button=' + buttonId + '&duration=' + alertConfiguration.duration).then(response => { if (!response.ok) throw Error("Server returned HTTP " + response.status); return response.text(); }).then(() => { if (!socketConnected) { setLogState("Ready"); addLog(category + " alert accepted.", "success"); } }).catch(error => { setLogState("Attention"); addLog(category + " alert failed: " + error.message, "error"); }); }
+function triggerAlert(buttonId) { const category = {1: "Hazard", 2: "Security", 3: "Medical concern"}[buttonId]; setLogState("Working"); if (!socketConnected) addLog("[ALERT_QUEUED] " + category + " emergency triggered via web UI. Awaiting worker capture...", "pending"); fetch('/trigger-alert?button=' + buttonId + '&duration=' + alertConfiguration.duration).then(response => { if (!response.ok) throw Error("Server returned HTTP " + response.status); return response.text(); }).then(() => { if (!socketConnected) { setLogState("Ready"); addLog("[ALERT_DISPATCHED] " + category + " alert successfully registered and processed.", "success"); } }).catch(error => { setLogState("Attention"); addLog("[ALERT_ERROR] " + category + " alert dispatch failed: " + error.message, "error"); }); }
 function connectSync() { const socket = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws"); syncSocket = socket; socket.onopen = () => { socketConnected = true; }; socket.onmessage = event => { const data = JSON.parse(event.data); if (data.type === "sync") { applyConfiguration(data); renderLogs(data.logs || []); setLogState(data.state || "Ready"); } else if (data.type === "configuration") applyConfiguration(data); else if (data.type === "log") addLogEntry(data.entry, data.state); else if (data.type === "logs_cleared") { renderLogs([]); setLogState(data.state || "Ready"); } }; socket.onclose = () => { socketConnected = false; setTimeout(connectSync, 2000); }; socket.onerror = () => socket.close(); }
 connectSync();
 </script></body></html>
@@ -495,11 +497,14 @@ def create_event():
         duration,
         queue_size,
     )
+    category_name = ALERT_CATEGORIES[button_id]
     record_activity(
-        f"{ALERT_CATEGORIES[button_id]} alert queued from device.", "pending"
+        f"[HARDWARE_SIGNAL] Received {category_name} event from ESP32 device node. Added to recording pipeline queue.", "pending"
     )
     send_sms_notification(button_id)
-    record_activity(f"{ALERT_CATEGORIES[button_id]} alert accepted.", "success")
+    record_activity(
+        f"[ALERT_DISPATCHED] {category_name} hardware event processed. SMS notifications broadcasted successfully.", "success"
+    )
     return jsonify(message="Event queued and SMS dispatched"), 202
 
 
@@ -558,7 +563,7 @@ def save_configuration():
         recipients,
     )
     broadcast({"type": "configuration", **configuration_payload()})
-    record_activity("Configuration saved.", "success")
+    record_activity("[CONFIG] System parameters updated and synchronized with active nodes.", "success")
     return jsonify(message="Configuration saved"), 200
 
 
@@ -584,14 +589,14 @@ def trigger_alert():
         recipients,
     )
     record_activity(
-        f"{category} alert queued; phone worker will record the video.",
+        f"[WEB_TRIGGER] {category} emergency requested via web console. Target CCTV recording worker activated.",
         "pending",
         "Working",
     )
 
     send_sms_notification(button_id)
 
-    record_activity(f"{category} alert accepted.", "success", "Ready")
+    record_activity(f"[ALERT_SUCCESS] {category} alert sequence accepted. Emergency protocols initiated.", "success", "Ready")
     return "Alert queued; the phone worker will record and upload the video.", 202
 
 
@@ -653,11 +658,13 @@ def upload_video():
         return jsonify(error="Only MP4 files are accepted"), 400
 
     video.save(UPLOAD_DIR / filename)
+    file_size_mb = (UPLOAD_DIR / filename).stat().st_size / (1024 * 1024)
     logger.info(
-        "Video uploaded: file=%s size=%d bytes",
+        "Video uploaded: file=%s size=%.2f MB",
         filename,
-        (UPLOAD_DIR / filename).stat().st_size,
+        file_size_mb,
     )
+    record_activity(f"[MEDIA_UPLOAD] Incident video successfully uploaded ({file_size_mb:.1f} MB): {filename}", "success")
     return jsonify(message="Upload successful", filename=filename), 201
 
 

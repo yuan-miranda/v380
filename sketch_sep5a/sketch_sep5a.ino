@@ -4,8 +4,7 @@
 const char* ssid = "Converge_2.4GHz_BtM2";
 const char* password = "Xd4AjFnJ";
 
-// VPS public IP; button events are queued there for the phone to poll.
-const char* serverIp = "178.128.82.49";
+const char* serverHost = "alerto.ddns.net";
 const char* eventToken = "qqqq";
 
 const int buttonPins[] = {15, 16, 17};
@@ -45,7 +44,7 @@ void loop() {
     if ((millis() - lastDebounceTime[i]) > debounceDelay) {
       if (reading != buttonState[i]) {
         if (buttonState[i] == LOW && reading == HIGH) {
-          int buttonNumber = i + 1; // Maps pin index to Button 1, 2, or 3
+          int buttonNumber = i + 1;
           
           Serial.print("Button ");
           Serial.print(buttonNumber);
@@ -54,7 +53,7 @@ void loop() {
           if (WiFi.status() == WL_CONNECTED) {
             HTTPClient http;
             
-            String url = String("http://") + serverIp + ":5000/events";
+            String url = String("http://") + serverHost + "/events";
             
             http.begin(url);
             http.addHeader("Authorization", String("Bearer ") + eventToken);
