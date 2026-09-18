@@ -81,6 +81,8 @@ SMS_TEMPLATE = DEFAULT_SMS_TEMPLATE
 pending_events = []
 active_event = None
 events_lock = threading.Lock()
+# Condition lets the worker wait for an event instead of polling an empty queue.
+events_condition = threading.Condition(events_lock)
 
 # Each WebSocket has its own send lock so one slow client cannot serialize all clients.
 clients = {}
@@ -841,6 +843,7 @@ def _accept_alert(button_id, duration, source):
         active_event = event
         pending_events.append(event)
         queue_size = len(pending_events)
+        events_condition.notify_all()
 
     category = ALERT_CATEGORIES[button_id]
     logger.info(
@@ -985,7 +988,13 @@ def next_event():
     if not has_token(EVENT_TOKEN):
         return jsonify(error="Unauthorized"), 401
 
-    with events_lock:
+    # Long-poll the queue. The worker no longer has to repeatedly reconnect to
+    # an empty endpoint, and an accepted alert wakes the request immediately.
+    # A bounded timeout keeps the connection recyclable if a proxy is idle.
+    wait_seconds = min(max(request.args.get("wait", default=25, type=float), 0.0), 30.0)
+    with events_condition:
+        if not pending_events and wait_seconds > 0:
+            events_condition.wait(timeout=wait_seconds)
         if not pending_events:
             return jsonify(event=None), 200
         event = pending_events.pop(0)

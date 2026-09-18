@@ -318,16 +318,40 @@ def poll_events():
     )
     headers = {"Authorization": f"Bearer {VPS_EVENT_TOKEN}"}
 
+    # The server endpoint long-polls while its queue is empty. This avoids the
+    # old fixed polling delay and, more importantly, makes an accepted alert
+    # wake the worker immediately. On a network failure we reconnect immediately
+    # instead of sleeping for the normal polling interval.
+    consecutive_failures = 0
     while True:
         try:
-            response = requests.get(VPS_EVENT_ENDPOINT, headers=headers, timeout=5)
+            response = requests.get(
+                VPS_EVENT_ENDPOINT,
+                params={"wait": 25},
+                headers=headers,
+                timeout=30,
+            )
             response.raise_for_status()
+            consecutive_failures = 0
             event = response.json().get("event")
             if event:
                 process_event(event)
+            else:
+                # Normal long-poll timeout; reconnect immediately.
+                continue
         except (requests.RequestException, ValueError, TypeError) as error:
-            logger.error("Event polling failed: %s", error)
-        time.sleep(POLL_INTERVAL_SECONDS)
+            consecutive_failures += 1
+            logger.error(
+                "Event polling failed (attempt %s): %s",
+                consecutive_failures,
+                error,
+            )
+            # Only back off after repeated failures. A single connection abort
+            # should not introduce an artificial 0.25/1/5-second alert delay.
+            if consecutive_failures >= 5:
+                time.sleep(min(2.0, consecutive_failures * 0.1))
+            else:
+                time.sleep(0.1)
 
 
 if __name__ == "__main__":
