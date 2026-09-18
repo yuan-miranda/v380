@@ -3,7 +3,10 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
+import threading
 import time
+from urllib.parse import quote
 from datetime import datetime
 from pathlib import Path
 
@@ -88,9 +91,28 @@ if not VPS_EVENT_STATUS_ENDPOINT and VPS_EVENT_ENDPOINT.endswith("/events/next")
 VPS_EVENT_TOKEN = os.getenv("VPS_EVENT_TOKEN", VPS_TOKEN)
 POLL_INTERVAL_SECONDS = max(0.1, float(os.getenv("POLL_INTERVAL_SECONDS", "0.25")))
 VIDEO_DURATION_SECONDS = int(os.getenv("VIDEO_DURATION_SECONDS", "60"))
-CCTV_IP = os.getenv("CCTV_IP", "192.168.100.57")
 RTSP_USER = os.getenv("RTSP_USER", "admin")
 RTSP_PASS = os.getenv("RTSP_PASS", "password")
+CCTV_RTSP_URL = os.getenv("CCTV_RTSP_URL", "").strip()
+CCTV_IP = os.getenv("CCTV_IP", "").strip()
+CONFIG_SYNC_INTERVAL_SECONDS = max(30, int(os.getenv("CONFIG_SYNC_INTERVAL_SECONDS", "60")))
+
+
+def background_config_sync():
+    """Refresh server settings without blocking the event polling loop."""
+    while True:
+        time.sleep(CONFIG_SYNC_INTERVAL_SECONDS)
+        try:
+            sync_server_env_to_config()
+            # Keep the manually entered CCTV setting authoritative.
+            if CCTV_RTSP_URL:
+                os.environ["CCTV_RTSP_URL"] = CCTV_RTSP_URL
+                os.environ.pop("CCTV_IP", None)
+            elif CCTV_IP:
+                os.environ["CCTV_IP"] = CCTV_IP
+                os.environ.pop("CCTV_RTSP_URL", None)
+        except Exception as error:
+            logger.warning("Background configuration sync failed: %s", error)
 
 
 def report_event_status(event_id, status, error=""):
@@ -133,10 +155,94 @@ def report_event_status(event_id, status, error=""):
         return False
 
 
-def get_live_rtsp_url():
+def _save_local_cctv(value):
+    """Persist the manually entered CCTV value without touching server settings."""
+    value = value.strip()
+    if not value:
+        return
+    try:
+        lines = ENV_FILE.read_text(encoding="utf-8").splitlines() if ENV_FILE.is_file() else []
+        filtered = [line for line in lines if not line.lstrip().startswith(("CCTV_RTSP_URL=", "CCTV_IP="))]
+        if value.lower().startswith("rtsp://"):
+            filtered.append(f"CCTV_RTSP_URL={value}")
+        else:
+            filtered.append(f"CCTV_IP={value}")
+        ENV_FILE.write_text("\n".join(filtered) + "\n", encoding="utf-8")
+    except OSError as error:
+        logger.warning("Could not persist CCTV setting locally: %s", error)
+
+
+def _get_manual_cctv_setting():
     load_local_env()
-    current_ip = os.getenv("CCTV_IP", CCTV_IP)
-    return f"rtsp://{RTSP_USER}:{RTSP_PASS}@{current_ip}:554/live/ch00_0"
+    url = os.getenv("CCTV_RTSP_URL", "").strip()
+    ip = os.getenv("CCTV_IP", "").strip()
+    return url or ip
+
+
+def get_live_rtsp_url():
+    global CCTV_RTSP_URL, CCTV_IP
+    setting = _get_manual_cctv_setting()
+
+    # A full RTSP URL is preferred because it lets the user specify the camera's
+    # exact path/port/credentials.
+    if setting.lower().startswith("rtsp://"):
+        return setting
+
+    if setting:
+        user = os.getenv("RTSP_USER", RTSP_USER)
+        password = os.getenv("RTSP_PASS", RTSP_PASS)
+        return f"rtsp://{quote(user, safe='')}:{quote(password, safe='')}@{setting}:554/live/ch00_0"
+
+    return ""
+
+
+def configure_cctv():
+    """Ask for the CCTV address once when running interactively.
+
+    No camera discovery is performed. The operator supplies either an IP/host
+    or the complete RTSP URL. An environment value can be used for unattended
+    startup.
+    """
+    global CCTV_RTSP_URL, CCTV_IP
+
+    cli_value = ""
+    if "--cctv" in sys.argv:
+        try:
+            cli_value = sys.argv[sys.argv.index("--cctv") + 1].strip()
+        except (IndexError, AttributeError):
+            logger.error("--cctv requires an IP address or RTSP URL")
+            raise SystemExit(2)
+
+    current = _get_manual_cctv_setting()
+    if cli_value:
+        current = cli_value
+    elif sys.stdin.isatty():
+        # Always let the operator choose the camera address. The value supplied
+        # by the server is only a fallback/default and is never auto-discovered.
+        prompt = "Enter CCTV IP/hostname or full RTSP URL"
+        if current:
+            entered = input(f"{prompt} [{current}]: ").strip()
+            if entered:
+                current = entered
+        else:
+            current = input(f"{prompt}: ").strip()
+
+    if not current:
+        logger.error(
+            "No CCTV address configured. Set CCTV_RTSP_URL/CCTV_IP or run: python main.py --cctv <IP-or-RTSP-URL>"
+        )
+        return False
+
+    if current.lower().startswith("rtsp://"):
+        CCTV_RTSP_URL = current
+        CCTV_IP = ""
+    else:
+        CCTV_IP = current
+        CCTV_RTSP_URL = ""
+
+    _save_local_cctv(current)
+    logger.info("CCTV address configured manually: %s", current)
+    return True
 
 
 def record_cctv_stream(filename, duration_seconds):
