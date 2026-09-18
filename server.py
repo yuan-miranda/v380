@@ -86,6 +86,54 @@ log_seq = 0
 MAX_LOG_ENTRIES = 80
 ALERT_CATEGORIES = {"1": "Hazard", "2": "Security", "3": "Medical Concern"}
 
+# --- Pastebin (separate feature, unrelated to ALERTO) ---
+PASTE_PATH = Path(__file__).resolve().with_name("pastebin.txt")
+PASTE_IMAGES_DIR = Path(__file__).resolve().with_name("pastebin_images")
+PASTE_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+ALLOWED_IMAGE_TYPES = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "image/bmp": ".bmp",
+    "image/x-ms-bmp": ".bmp",
+    "image/avif": ".avif",
+    "image/svg+xml": ".svg",
+    "image/heic": ".heic",
+    "image/heif": ".heif",
+}
+ALLOWED_IMAGE_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".avif", ".svg", ".heic", ".heif",
+}
+paste_text = ""
+paste_lock = threading.Lock()
+paste_clients = set()
+paste_clients_lock = threading.Lock()
+
+
+def load_saved_paste():
+    global paste_text
+    if PASTE_PATH.is_file():
+        try:
+            paste_text = PASTE_PATH.read_text(encoding="utf-8")
+        except OSError as error:
+            logger.warning("Could not load pastebin.txt: %s", error)
+
+
+def broadcast_paste(payload, exclude=None):
+    data = json.dumps(payload)
+    with paste_clients_lock:
+        sockets = list(paste_clients)
+    for websocket in sockets:
+        if websocket is exclude:
+            continue
+        try:
+            with send_lock:
+                websocket.send(data)
+        except Exception:
+            with paste_clients_lock:
+                paste_clients.discard(websocket)
+
 
 class TemplateValues(dict):
     def __missing__(self, key):
@@ -289,6 +337,7 @@ def activity_snapshot():
 
 
 load_saved_configuration()
+load_saved_paste()
 
 
 WEB_PAGE = """
@@ -680,6 +729,448 @@ def websocket(ws):
     finally:
         with clients_lock:
             clients.discard(ws)
+
+
+PASTEBIN_PAGE = r"""
+<!doctype html>
+<html>
+<head>
+    <title>ELMS</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        * { box-sizing: border-box; }
+        html, body { margin: 0; padding: 0; height: 100%; background: #fff; }
+        #paste { position: fixed; inset: 0; width: 100%; height: 100%; overflow-y: auto; border: none; outline: none; background: #fff; color: #000; font: 14px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; padding: 10px; white-space: pre-wrap; word-wrap: break-word; }
+        #paste:empty::before { content: attr(data-placeholder); color: #999; pointer-events: none; }
+        #paste img { max-width: 100%; height: auto; display: block; margin: 6px 0; border: 1px solid #000; }
+        #paste img.img-selected { outline: 2px solid #0078d4; outline-offset: 1px; }
+        .resize-handle { position: fixed; width: 12px; height: 12px; background: #0078d4; border: 1px solid #fff; box-sizing: border-box; cursor: se-resize; z-index: 2; touch-action: none; }
+        .bar { position: fixed; right: 3px; bottom: 3px; display: flex; gap: 6px; z-index: 1; }
+        button { padding: 2px 4px; border: 1px solid #000; background: #fff; color: #000; font: inherit; font-size: 12px; cursor: pointer; }
+        #status { position: fixed; left: 3px; bottom: 3px; font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: #666; z-index: 1; }
+        #paste.drag-over { background: #f0f0f0; }
+    </style>
+</head>
+<body>
+    <div id="paste" contenteditable="true" spellcheck="false" data-placeholder="Paste or type here... (images can be pasted or dropped too)"></div>
+    <div id="status"></div>
+    <div class="bar">
+        <button onclick="copyText()">Copy</button>
+    </div>
+<script>
+const area = document.getElementById("paste");
+const status = document.getElementById("status");
+let socket = null;
+let saveTimer = null;
+let savedFadeTimer = null;
+let reconnectTimer = null;
+let pageCaching = false;
+
+function setStatus(text) {
+    clearTimeout(savedFadeTimer);
+    status.textContent = text;
+}
+
+// --- HTML sanitization -----------------------------------------------
+// The editor is contenteditable, and its markup gets synced verbatim to
+// every connected client and written straight into innerHTML there. To
+// keep that from becoming an XSS vector (e.g. someone pasting rich HTML
+// from another site, or a rogue client talking to the websocket directly),
+// every piece of HTML is sanitized down to an allowlist before it is
+// rendered anywhere: plain text, <br>, <div> (Chrome wraps lines in these),
+// and <img> whose src points at our own uploaded-image endpoint. Anything
+// else is unwrapped to its plain text content.
+function sanitizeHtml(html) {
+    const template = document.createElement("template");
+    template.innerHTML = html;
+    sanitizeChildren(template.content);
+    return template.innerHTML;
+}
+
+function sanitizeChildren(node) {
+    for (const child of Array.from(node.childNodes)) {
+        if (child.nodeType === Node.TEXT_NODE) continue;
+        if (child.nodeType !== Node.ELEMENT_NODE) { child.remove(); continue; }
+
+        const tag = child.tagName.toLowerCase();
+        if (tag === "img") {
+            const src = child.getAttribute("src") || "";
+            if (!/^\/pastebin-image\//.test(src)) { child.remove(); continue; }
+            // Preserve a user-set width (from the resize handle) but only
+            // ever as a bare "width:<number>px;" value, never raw style text,
+            // so this can't be used to smuggle arbitrary CSS.
+            const style = child.getAttribute("style") || "";
+            const widthMatch = /^\s*width:\s*(\d+(?:\.\d+)?)px;?\s*$/i.exec(style);
+            for (const attr of Array.from(child.attributes)) {
+                if (attr.name !== "src" && attr.name !== "alt") child.removeAttribute(attr.name);
+            }
+            if (widthMatch) {
+                const width = Math.max(20, Math.min(4000, parseFloat(widthMatch[1])));
+                child.setAttribute("style", `width:${width}px;`);
+            }
+            continue;
+        }
+        if (tag === "br" || tag === "div") {
+            for (const attr of Array.from(child.attributes)) child.removeAttribute(attr.name);
+            sanitizeChildren(child);
+            continue;
+        }
+        // Unknown/disallowed element: keep its text, drop the tag itself.
+        const text = document.createTextNode(child.textContent);
+        child.replaceWith(text);
+    }
+}
+
+function connect() {
+    setStatus("Connecting...");
+    socket = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/pastebin-ws");
+    socket.onopen = () => setStatus("");
+    socket.onmessage = event => {
+        const data = JSON.parse(event.data);
+        if (data.type === "update" && document.activeElement !== area) {
+            deselectImage();
+            area.innerHTML = sanitizeHtml(data.text || "");
+        }
+        if (data.type === "saved") {
+            setStatus("Saved");
+            savedFadeTimer = setTimeout(() => { status.textContent = ""; }, 1200);
+        }
+    };
+    socket.onclose = () => {
+        // If the page is being frozen into the back/forward cache, don't
+        // bother reconnecting - pageshow will reconnect if/when it's restored.
+        if (pageCaching) return;
+        setStatus("Offline, reconnecting...");
+        clearTimeout(reconnectTimer);
+        reconnectTimer = setTimeout(connect, 2000);
+    };
+    socket.onerror = () => socket.close();
+}
+connect();
+
+window.addEventListener("pagehide", event => {
+    if (!event.persisted) return;
+    // Chrome closes any open sockets when caching the page for instant
+    // back/forward navigation; close it ourselves first to avoid the
+    // "entered Back-Forward Cache" console error, and skip auto-reconnect.
+    pageCaching = true;
+    clearTimeout(reconnectTimer);
+    if (socket) socket.close();
+});
+
+window.addEventListener("pageshow", event => {
+    if (!event.persisted) return;
+    // Page was restored from bfcache; the old socket is dead, reconnect.
+    pageCaching = false;
+    connect();
+});
+
+area.addEventListener("input", () => {
+    setStatus("Syncing...");
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(sendHtml, 300);
+});
+
+function sendHtml() {
+    if (socket && socket.readyState === WebSocket.OPEN) {
+        setStatus("Saving...");
+        socket.send(JSON.stringify({ type: "update", text: sanitizeHtml(area.innerHTML) }));
+    }
+}
+
+function copyText() {
+    navigator.clipboard.writeText(area.textContent);
+}
+
+// --- Cursor-position insertion -----------------------------------------
+function getEditableRange() {
+    const selection = window.getSelection();
+    if (selection && selection.rangeCount > 0) {
+        const range = selection.getRangeAt(0);
+        if (area.contains(range.commonAncestorContainer)) return range;
+    }
+    // No caret in the editor (e.g. a drop without a prior click): fall
+    // back to the end of the content.
+    const range = document.createRange();
+    range.selectNodeContents(area);
+    range.collapse(false);
+    return range;
+}
+
+function insertNodeAtRange(node, range) {
+    range.deleteContents();
+    range.insertNode(node);
+    range.setStartAfter(node);
+    range.collapse(true);
+    const selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+}
+
+function insertTextAtRange(text, range) {
+    insertNodeAtRange(document.createTextNode(text), range);
+}
+
+function insertImageAtRange(url, range) {
+    const img = document.createElement("img");
+    img.src = url;
+    img.alt = "pasted image";
+    insertNodeAtRange(img, range);
+    area.dispatchEvent(new Event("input"));
+}
+
+// --- Image resizing -----------------------------------------------------
+// Click an image to select it and drag the handle at its corner to resize.
+// The handle itself lives outside #paste (so it never gets synced) and is
+// repositioned on scroll/resize while an image stays selected.
+let selectedImg = null;
+let resizeHandle = null;
+let resizeState = null;
+
+function positionHandle() {
+    if (!selectedImg || !resizeHandle) return;
+    const rect = selectedImg.getBoundingClientRect();
+    resizeHandle.style.left = `${rect.right - 6}px`;
+    resizeHandle.style.top = `${rect.bottom - 6}px`;
+}
+
+function selectImage(img) {
+    if (selectedImg === img) return;
+    deselectImage();
+    selectedImg = img;
+    selectedImg.classList.add("img-selected");
+    resizeHandle = document.createElement("div");
+    resizeHandle.className = "resize-handle";
+    document.body.appendChild(resizeHandle);
+    positionHandle();
+    resizeHandle.addEventListener("pointerdown", startResize);
+}
+
+function deselectImage() {
+    if (selectedImg) selectedImg.classList.remove("img-selected");
+    if (resizeHandle) resizeHandle.remove();
+    selectedImg = null;
+    resizeHandle = null;
+}
+
+function startResize(event) {
+    if (!selectedImg) return;
+    event.preventDefault();
+    event.stopPropagation();
+    resizeState = {
+        startX: event.clientX,
+        startWidth: selectedImg.getBoundingClientRect().width,
+    };
+    resizeHandle.setPointerCapture(event.pointerId);
+    resizeHandle.addEventListener("pointermove", onResizeMove);
+    resizeHandle.addEventListener("pointerup", endResize);
+}
+
+function onResizeMove(event) {
+    if (!resizeState || !selectedImg) return;
+    const width = Math.max(20, resizeState.startWidth + (event.clientX - resizeState.startX));
+    selectedImg.style.width = `${Math.round(width)}px`;
+    positionHandle();
+}
+
+function endResize(event) {
+    resizeHandle.releasePointerCapture(event.pointerId);
+    resizeHandle.removeEventListener("pointermove", onResizeMove);
+    resizeHandle.removeEventListener("pointerup", endResize);
+    resizeState = null;
+    area.dispatchEvent(new Event("input"));
+}
+
+area.addEventListener("click", event => {
+    if (event.target.tagName === "IMG" && area.contains(event.target)) {
+        selectImage(event.target);
+    } else {
+        deselectImage();
+    }
+});
+
+document.addEventListener("click", event => {
+    if (event.target === resizeHandle) return;
+    if (!area.contains(event.target)) deselectImage();
+});
+
+area.addEventListener("scroll", positionHandle);
+window.addEventListener("resize", positionHandle);
+window.addEventListener("scroll", positionHandle, true);
+
+const IMAGE_EXTENSION_RE = /\.(png|jpe?g|gif|webp|bmp|avif|svg|heic|heif)$/i;
+
+function isImageFile(file) {
+    if (!file) return false;
+    if (file.type && file.type.startsWith("image/")) return true;
+    // File managers often hand over files with an empty or generic
+    // (e.g. application/octet-stream) type, so fall back to the extension.
+    return IMAGE_EXTENSION_RE.test(file.name || "");
+}
+
+async function uploadImage(file, range) {
+    setStatus("Uploading image...");
+    const formData = new FormData();
+    formData.append("image", file, file.name || "pasted-image.png");
+    try {
+        const response = await fetch("/pastebin-image", { method: "POST", body: formData });
+        if (!response.ok) throw new Error("Upload failed");
+        const data = await response.json();
+        insertImageAtRange(data.url, range);
+        setStatus("");
+    } catch (error) {
+        setStatus("Image upload failed");
+        savedFadeTimer = setTimeout(() => { status.textContent = ""; }, 2000);
+    }
+}
+
+area.addEventListener("paste", event => {
+    const items = event.clipboardData ? event.clipboardData.items : [];
+    for (const item of items) {
+        if (item.kind === "file") {
+            const file = item.getAsFile();
+            if (isImageFile(file)) {
+                event.preventDefault();
+                uploadImage(file, getEditableRange());
+                return;
+            }
+        }
+    }
+    // Plain text paste: insert as literal text, not rich HTML from the
+    // clipboard source, so the editor's content stays within our allowlist.
+    const text = event.clipboardData ? event.clipboardData.getData("text/plain") : "";
+    if (text) {
+        event.preventDefault();
+        insertTextAtRange(text, getEditableRange());
+        area.dispatchEvent(new Event("input"));
+    }
+});
+
+area.addEventListener("dragenter", event => {
+    if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+    event.preventDefault();
+    area.classList.add("drag-over");
+});
+
+area.addEventListener("dragover", event => {
+    if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+    event.preventDefault();
+    area.classList.add("drag-over");
+});
+
+area.addEventListener("dragleave", () => {
+    area.classList.remove("drag-over");
+});
+
+function rangeFromPoint(x, y) {
+    if (document.caretRangeFromPoint) {
+        return document.caretRangeFromPoint(x, y);
+    }
+    if (document.caretPositionFromPoint) {
+        const pos = document.caretPositionFromPoint(x, y);
+        if (!pos) return null;
+        const range = document.createRange();
+        range.setStart(pos.offsetNode, pos.offset);
+        range.collapse(true);
+        return range;
+    }
+    return null;
+}
+
+area.addEventListener("drop", event => {
+    event.preventDefault();
+    area.classList.remove("drag-over");
+    const files = event.dataTransfer ? Array.from(event.dataTransfer.files) : [];
+    const images = files.filter(isImageFile);
+    if (images.length) {
+        const dropRange = rangeFromPoint(event.clientX, event.clientY) || getEditableRange();
+        images.forEach(file => uploadImage(file, dropRange.cloneRange()));
+    } else if (files.length) {
+        setStatus("Dropped file isn't a recognized image");
+        savedFadeTimer = setTimeout(() => { status.textContent = ""; }, 2000);
+    }
+});
+</script>
+</body>
+</html>
+"""
+
+
+@app.get("/pastebin")
+def pastebin_page():
+    return render_template_string(PASTEBIN_PAGE, paste_text=paste_text)
+
+
+@app.post("/pastebin-image")
+def pastebin_image_upload():
+    image = request.files.get("image")
+    if image is None or not image.filename:
+        return jsonify(error="Missing image file"), 400
+
+    content_type = (image.mimetype or "").lower()
+    extension = ALLOWED_IMAGE_TYPES.get(content_type)
+    if not extension:
+        guessed = Path(secure_filename(image.filename)).suffix.lower()
+        if guessed in ALLOWED_IMAGE_EXTENSIONS:
+            extension = ".jpg" if guessed == ".jpeg" else guessed
+        else:
+            return jsonify(error="Unsupported image type"), 400
+
+    timestamp = datetime.now(MANILA_TIMEZONE).strftime("%Y%m%d_%H%M%S_%f")
+    filename = f"paste_{timestamp}{extension}"
+    image.save(PASTE_IMAGES_DIR / filename)
+    logger.info("Pastebin image uploaded: file=%s", filename)
+    return jsonify(url=f"/pastebin-image/{filename}"), 201
+
+
+@app.get("/pastebin-image/<path:filename>")
+def pastebin_image_view(filename):
+    safe_filename = Path(filename)
+    if safe_filename.name != filename:
+        abort(404)
+
+    image_path = PASTE_IMAGES_DIR / safe_filename.name
+    if not image_path.is_file():
+        abort(404)
+
+    return send_from_directory(PASTE_IMAGES_DIR, safe_filename.name)
+
+
+@sock.route("/pastebin-ws")
+def pastebin_websocket(ws):
+    global paste_text
+    with paste_clients_lock:
+        paste_clients.add(ws)
+    try:
+        with send_lock:
+            ws.send(json.dumps({"type": "update", "text": paste_text}))
+        while True:
+            raw = ws.receive()
+            if raw is None:
+                break
+            try:
+                data = json.loads(raw)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if data.get("type") == "update":
+                text = str(data.get("text", ""))
+                with paste_lock:
+                    paste_text = text
+                    try:
+                        PASTE_PATH.write_text(text, encoding="utf-8")
+                    except OSError as error:
+                        logger.warning("Could not save pastebin.txt: %s", error)
+                broadcast_paste({"type": "update", "text": text}, exclude=ws)
+                try:
+                    with send_lock:
+                        ws.send(json.dumps({"type": "saved"}))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    finally:
+        with paste_clients_lock:
+            paste_clients.discard(ws)
 
 
 @app.post("/upload")
