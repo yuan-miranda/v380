@@ -3,6 +3,9 @@ import json
 import logging
 import struct
 import threading
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -62,6 +65,7 @@ TARGET_MOBILE = os.getenv("TARGET_MOBILE", "")
 VIDEO_DURATION_SECONDS = int(os.getenv("VIDEO_DURATION_SECONDS", "60"))
 CCTV_IP = os.getenv("CCTV_IP", "192.168.100.57")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://alerto.ddns.net")
+ALERT_LOCK_EXTRA_SECONDS = int(os.getenv("ALERT_LOCK_EXTRA_SECONDS", "180"))
 MANILA_TIMEZONE = ZoneInfo("Asia/Manila")
 CONFIG_PATH = Path(__file__).resolve().with_name("config.json")
 DEFAULT_SMS_TEMPLATE = (
@@ -75,64 +79,19 @@ DEFAULT_SMS_TEMPLATE = (
 )
 SMS_TEMPLATE = DEFAULT_SMS_TEMPLATE
 pending_events = []
+active_event = None
 events_lock = threading.Lock()
-clients = set()
+
+# Each WebSocket has its own send lock so one slow client cannot serialize all clients.
+clients = {}
 clients_lock = threading.Lock()
-send_lock = threading.Lock()
+
 activity_logs = []
 activity_lock = threading.Lock()
 log_state = "Ready"
 log_seq = 0
 MAX_LOG_ENTRIES = 80
 ALERT_CATEGORIES = {"1": "Hazard", "2": "Security", "3": "Medical Concern"}
-
-# --- Pastebin (separate feature, unrelated to ALERTO) ---
-PASTE_PATH = Path(__file__).resolve().with_name("pastebin.txt")
-PASTE_IMAGES_DIR = Path(__file__).resolve().with_name("pastebin_images")
-PASTE_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
-ALLOWED_IMAGE_TYPES = {
-    "image/png": ".png",
-    "image/jpeg": ".jpg",
-    "image/gif": ".gif",
-    "image/webp": ".webp",
-    "image/bmp": ".bmp",
-    "image/x-ms-bmp": ".bmp",
-    "image/avif": ".avif",
-    "image/svg+xml": ".svg",
-    "image/heic": ".heic",
-    "image/heif": ".heif",
-}
-ALLOWED_IMAGE_EXTENSIONS = {
-    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".avif", ".svg", ".heic", ".heif",
-}
-paste_text = ""
-paste_lock = threading.Lock()
-paste_clients = set()
-paste_clients_lock = threading.Lock()
-
-
-def load_saved_paste():
-    global paste_text
-    if PASTE_PATH.is_file():
-        try:
-            paste_text = PASTE_PATH.read_text(encoding="utf-8")
-        except OSError as error:
-            logger.warning("Could not load pastebin.txt: %s", error)
-
-
-def broadcast_paste(payload, exclude=None):
-    data = json.dumps(payload)
-    with paste_clients_lock:
-        sockets = list(paste_clients)
-    for websocket in sockets:
-        if websocket is exclude:
-            continue
-        try:
-            with send_lock:
-                websocket.send(data)
-        except Exception:
-            with paste_clients_lock:
-                paste_clients.discard(websocket)
 
 
 class TemplateValues(dict):
@@ -142,7 +101,7 @@ class TemplateValues(dict):
 
 def render_sms_message(category, video_filename=""):
     if not video_filename:
-        now_str = datetime.now(MANILA_TIMEZONE).strftime("%Y-%m-%d_%H-%M-%S")
+        now_str = datetime.now(MANILA_TIMEZONE).strftime("%Y-%m-%d_%H-%M-%S-%f")
         btn_map = {"Hazard": "1", "Security": "2", "Medical Concern": "3"}
         b_id = btn_map.get(category, "2")
         video_filename = f"evidence_btn{b_id}_{now_str}.mp4"
@@ -158,44 +117,178 @@ def render_sms_message(category, video_filename=""):
     )
 
 
+def _send_sms_to_recipient(recipient, message, button_id):
+    headers = {
+        "Authorization": f"Bearer {PHILSMS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    requests.post(
+        PHILSMS_URL,
+        json={
+            "recipient": recipient,
+            "sender_id": SENDER_ID,
+            "type": "plain",
+            "message": message,
+        },
+        headers=headers,
+        timeout=20,
+    ).raise_for_status()
+    logger.info("SMS sent: recipient=%s button=%s", recipient, button_id)
+
+
 def send_sms_notification(button_id, video_filename=""):
+    """Send SMS independently so the alert request is never blocked by SMS or video upload."""
     category = ALERT_CATEGORIES.get(button_id, "Hazard")
     recipients = recipient_list(TARGET_MOBILE)
-    if SEND_SMS and PHILSMS_URL and PHILSMS_TOKEN:
-        try:
-            message = render_sms_message(category, video_filename)
-        except ValueError:
-            now_str = datetime.now(MANILA_TIMEZONE).strftime("%Y-%m-%d_%H-%M-%S")
-            fallback_video_url = f"{PUBLIC_BASE_URL.rstrip('/')}/videos/evidence_btn{button_id}_{now_str}.mp4?token={VIEW_TOKEN}"
-            message = DEFAULT_SMS_TEMPLATE.format_map(
-                TemplateValues(
-                    product_name=PRODUCT_NAME,
-                    category=category,
-                    timestamp=datetime.now(MANILA_TIMEZONE).strftime("%B %d, %Y — %I:%M %p"),
-                    video_url=fallback_video_url
-                )
+
+    if not recipients:
+        logger.warning("SMS not sent: no recipients configured")
+        record_activity(
+            f"[SMS_ERROR] No SMS recipients are configured for {category}.",
+            "error",
+        )
+        return False
+
+    if not SEND_SMS:
+        logger.info("SMS disabled: recipients=%s", recipients)
+        record_activity(
+            f"[SMS_DISABLED] SMS sending is disabled for {category}.",
+            "pending",
+        )
+        return False
+
+    if not PHILSMS_URL or not PHILSMS_TOKEN:
+        logger.warning("SMS not sent: PHILSMS_URL or PHILSMS_TOKEN is missing")
+        record_activity(
+            f"[SMS_ERROR] PhilSMS is not configured for {category}.",
+            "error",
+        )
+        return False
+
+    try:
+        message = render_sms_message(category, video_filename)
+    except ValueError:
+        now_str = datetime.now(MANILA_TIMEZONE).strftime("%Y-%m-%d_%H-%M-%S-%f")
+        fallback_video_url = (
+            f"{PUBLIC_BASE_URL.rstrip('/')}/videos/"
+            f"evidence_btn{button_id}_{now_str}.mp4?token={VIEW_TOKEN}"
+        )
+        message = DEFAULT_SMS_TEMPLATE.format_map(
+            TemplateValues(
+                product_name=PRODUCT_NAME,
+                category=category,
+                timestamp=datetime.now(MANILA_TIMEZONE).strftime(
+                    "%B %d, %Y — %I:%M %p"
+                ),
+                video_url=fallback_video_url,
             )
-        headers = {"Authorization": f"Bearer {PHILSMS_TOKEN}", "Content-Type": "application/json"}
-        for recipient in recipients:
+        )
+
+    record_activity(
+        f"[SMS_DISPATCH] Sending {category} emergency SMS to {len(recipients)} recipient(s).",
+        "pending",
+    )
+
+    success_count = 0
+    with ThreadPoolExecutor(max_workers=min(10, len(recipients))) as executor:
+        futures = {
+            executor.submit(
+                _send_sms_to_recipient, recipient, message, button_id
+            ): recipient
+            for recipient in recipients
+        }
+        for future in as_completed(futures):
+            recipient = futures[future]
             try:
-                requests.post(
-                    PHILSMS_URL,
-                    json={
-                        "recipient": recipient,
-                        "sender_id": SENDER_ID,
-                        "type": "plain",
-                        "message": message,
-                    },
-                    headers=headers,
-                    timeout=20,
-                ).raise_for_status()
-                logger.info("SMS sent: recipient=%s button=%s", recipient, button_id)
+                future.result()
+                success_count += 1
             except requests.RequestException as error:
                 logger.error("SMS failed: recipient=%s error=%s", recipient, error)
-    elif not SEND_SMS:
-        logger.info("SMS disabled: recipients=%s", recipients)
-    else:
-        logger.warning("SMS not sent: PHILSMS_URL or PHILSMS_TOKEN is missing")
+
+    if success_count == len(recipients):
+        record_activity(
+            f"[SMS_SENT] Emergency SMS sent successfully to all {success_count} configured recipient(s).",
+            "success",
+        )
+        return True
+
+    if success_count:
+        record_activity(
+            f"[SMS_PARTIAL] Emergency SMS sent to {success_count}/{len(recipients)} recipient(s).",
+            "error",
+        )
+        return False
+
+    record_activity(
+        f"[SMS_ERROR] Emergency SMS failed for all {len(recipients)} recipient(s).",
+        "error",
+    )
+    return False
+
+
+def dispatch_sms_async(button_id, video_filename):
+    threading.Thread(
+        target=send_sms_notification,
+        args=(button_id, video_filename),
+        name=f"sms-{button_id}",
+        daemon=True,
+    ).start()
+
+
+def _clear_active_event(event_id, state="Ready"):
+    global active_event
+
+    with events_lock:
+        if not active_event or active_event.get("id") != event_id:
+            return False
+        active_event = None
+
+    broadcast(
+        {
+            "type": "alert_state",
+            "busy": False,
+            "active_event": None,
+            "state": state,
+        }
+    )
+    return True
+
+
+def _expire_alert_lock(event_id):
+    global active_event
+
+    expired = False
+    with events_lock:
+        if active_event and active_event.get("id") == event_id:
+            active_event = None
+            pending_events.clear()
+            expired = True
+
+    if expired:
+        record_activity(
+            "[ALERT_TIMEOUT] Alert lock expired before the worker reported completion; new alerts are accepted.",
+            "error",
+            "Ready",
+        )
+        broadcast(
+            {
+                "type": "alert_state",
+                "busy": False,
+                "active_event": None,
+                "state": "Ready",
+            }
+        )
+
+
+def _schedule_alert_expiry(event_id, duration):
+    timer = threading.Timer(
+        max(30, duration + ALERT_LOCK_EXTRA_SECONDS),
+        _expire_alert_lock,
+        args=(event_id,),
+    )
+    timer.daemon = True
+    timer.start()
+
 
 
 def load_saved_configuration():
@@ -281,6 +374,9 @@ def display_recipient(value):
 
 def configuration_payload():
     recipients = recipient_list(TARGET_MOBILE)
+    with events_lock:
+        current_event = dict(active_event) if active_event else None
+
     return {
         "duration": VIDEO_DURATION_SECONDS,
         "cctv_ip": CCTV_IP,
@@ -288,20 +384,25 @@ def configuration_payload():
             [display_recipient(recipient) for recipient in recipients] + [""] * 10
         )[:10],
         "message": SMS_TEMPLATE,
+        "busy": current_event is not None,
+        "active_event": current_event,
     }
+
 
 
 def broadcast(payload):
     data = json.dumps(payload)
     with clients_lock:
-        sockets = list(clients)
-    for websocket in sockets:
+        socket_items = list(clients.items())
+
+    for websocket, client_lock in socket_items:
         try:
-            with send_lock:
+            with client_lock:
                 websocket.send(data)
         except Exception:
             with clients_lock:
-                clients.discard(websocket)
+                clients.pop(websocket, None)
+
 
 
 def record_activity(message, level, state=None):
@@ -337,7 +438,6 @@ def activity_snapshot():
 
 
 load_saved_configuration()
-load_saved_paste()
 
 
 WEB_PAGE = """
@@ -361,7 +461,7 @@ WEB_PAGE = """
         .subtitle { color: #64748b; margin: 0 0 30px; font-size: 14px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; }
         .button-stack { display: flex; flex-direction: column; gap: 16px; width: 100%; max-width: 34rem; margin: 0 auto; }
         button { width: 100%; height: clamp(160px, 38vw, 220px); padding: 18px; font-size: clamp(21px, 6vw, 28px); color: white; border: none; border-radius: 0; cursor: pointer; font-weight: 700; box-shadow: none; transition: transform 0.1s ease, opacity 0.2s; touch-action: manipulation; }
-        button:active { transform: scale(0.98); opacity: 0.9; }
+        button:active { transform: scale(0.98); opacity: 0.9; } button:disabled { opacity: 0.45; cursor: not-allowed; transform: none; }
         .btn-hazard { background: #d97706; } .btn-security { background: #b91c1c; } .btn-medical { background: #047857; }
         .activity-log { width: 100%; max-width: 34rem; margin: 24px auto 0; border: 1px solid #cbd5e1; background: #ffffff; text-align: left; }
         .log-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 12px 14px; border-bottom: 1px solid #e2e8f0; color: #1e293b; font-size: 13px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; }
@@ -409,16 +509,6 @@ WEB_PAGE = """
 <script>
 if ('serviceWorker' in navigator) { window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js')); }
 
-if (sessionStorage.getItem("alerto_unlocked") !== "true") {
-    let password = prompt("Enter security password:");
-    if (password === "alerto") {
-        sessionStorage.setItem("alerto_unlocked", "true");
-    } else {
-        alert("Incorrect password.");
-        location.reload();
-    }
-}
-
 function formatRecipient(input) { let digits = input.value.replace(/\D/g, ""); if (digits.startsWith("63")) digits = "0" + digits.slice(2); if (digits.startsWith("9")) digits = "0" + digits; input.value = digits.slice(0, 11); }
 document.querySelectorAll(".recipient-slot").forEach(input => { input.addEventListener("input", () => formatRecipient(input)); input.addEventListener("blur", () => formatRecipient(input)); });
 const alertConfiguration = { duration: Number(document.getElementById("duration").value), recipient: Array.from(document.querySelectorAll(".recipient-slot")).map(input => input.value).filter(Boolean).join(",") };
@@ -426,19 +516,188 @@ const defaultSmsTemplate = {{ default_sms_template | tojson }};
 const seenLogIds = new Set();
 let syncSocket = null;
 let socketConnected = false;
-function escapeHtml(value) { return String(value).replace(/[&<>"']/g, character => ({"&":"&amp;","<":"&lt;",">":"&gt;",[String.fromCharCode(34)]:"&quot;","'":"&#39;"}[character])); }
-function setLogState(state) { document.getElementById("log-state").innerText = state || "Ready"; }
-function logEntryHtml(entry) { return '<div class="log-entry ' + escapeHtml(entry.level || "") + '"><span class="log-time">' + escapeHtml(entry.time || "") + '</span><span class="log-message">' + escapeHtml(entry.message || "") + '</span></div>'; }
-function renderLogs(logs) { seenLogIds.clear(); const status = document.getElementById("status"); if (!logs || !logs.length) { status.innerHTML = '<div class="log-empty">No alerts recorded in this session.</div>'; return; } logs.forEach(entry => { if (entry.id) seenLogIds.add(entry.id); }); status.innerHTML = logs.map(logEntryHtml).join(""); }
-function addLogEntry(entry, state) { if (!entry) return; if (entry.id) { if (seenLogIds.has(entry.id)) { if (state) setLogState(state); return; } seenLogIds.add(entry.id); } const status = document.getElementById("status"); const empty = status.querySelector(".log-empty"); if (empty) empty.remove(); status.insertAdjacentHTML("afterbegin", logEntryHtml(entry)); if (state) setLogState(state); }
-function addLog(message, level) { addLogEntry({ time: new Date().toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"}), message: message, level: level }); }
-function applyConfiguration(data) { if (!data) return; if (data.cctv_ip != null) document.getElementById("cctv_ip").value = data.cctv_ip; if (data.duration != null) { document.getElementById("duration").value = data.duration; alertConfiguration.duration = Number(data.duration); } if (Array.isArray(data.recipients)) { document.querySelectorAll(".recipient-slot").forEach((input, index) => { input.value = data.recipients[index] || ""; }); alertConfiguration.recipient = data.recipients.filter(Boolean).join(","); } if (data.message != null) document.getElementById("message").value = data.message; }
-window.toggleConfiguration = function() { document.getElementById("configuration").classList.toggle("open"); };
-function resetSmsTemplate() { document.getElementById("message").value = defaultSmsTemplate; }
-function saveConfiguration(event) { event.preventDefault(); const cctv_ip = document.getElementById("cctv_ip").value.trim(); const duration = Number(document.getElementById("duration").value); const recipient = Array.from(document.querySelectorAll(".recipient-slot")).map(input => input.value.trim()).filter(Boolean).join(","); const message = document.getElementById("message").value; fetch("/configuration", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({cctv_ip: cctv_ip, duration: duration, recipient: recipient, message: message}) }).then(response => response.json().then(data => { if (!response.ok) throw Error(data.error || ("Server returned HTTP " + response.status)); return data; })).then(() => { if (!socketConnected) addLog("[CONFIG] System settings updated successfully.", "success"); }).catch(error => addLog("[CONFIG_ERROR] Failed to save configuration: " + error.message, "error")); }
-function clearLog() { renderLogs([]); setLogState("Ready"); if (syncSocket && syncSocket.readyState === WebSocket.OPEN) syncSocket.send(JSON.stringify({type: "clear_logs"})); }
-function triggerAlert(buttonId) { const category = {1: "Hazard", 2: "Security", 3: "Medical concern"}[buttonId]; setLogState("Working"); if (!socketConnected) addLog("[ALERT_QUEUED] " + category + " emergency triggered via web UI. Awaiting worker capture...", "pending"); fetch('/trigger-alert?button=' + buttonId + '&duration=' + alertConfiguration.duration).then(response => { if (!response.ok) throw Error("Server returned HTTP " + response.status); return response.text(); }).then(() => { if (!socketConnected) { setLogState("Ready"); addLog("[ALERT_DISPATCHED] " + category + " alert successfully registered and processed.", "success"); } }).catch(error => { setLogState("Attention"); addLog("[ALERT_ERROR] " + category + " alert dispatch failed: " + error.message, "error"); }); }
-function connectSync() { const socket = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws"); syncSocket = socket; socket.onopen = () => { socketConnected = true; }; socket.onmessage = event => { const data = JSON.parse(event.data); if (data.type === "sync") { applyConfiguration(data); renderLogs(data.logs || []); setLogState(data.state || "Ready"); } else if (data.type === "configuration") applyConfiguration(data); else if (data.type === "log") addLogEntry(data.entry, data.state); else if (data.type === "logs_cleared") { renderLogs([]); setLogState(data.state || "Ready"); } }; socket.onclose = () => { socketConnected = false; setTimeout(connectSync, 2000); }; socket.onerror = () => socket.close(); }
+let alertBusy = false;
+
+function escapeHtml(value) {
+    return String(value).replace(/[&<>"']/g, character => ({
+        "&":"&amp;", "<":"&lt;", ">":"&gt;",
+        [String.fromCharCode(34)]:"&quot;", "'":"&#39;"
+    }[character]));
+}
+function setLogState(state) {
+    document.getElementById("log-state").innerText = state || "Ready";
+}
+function setAlertBusy(busy, state) {
+    alertBusy = Boolean(busy);
+    document.querySelectorAll(".button-stack button").forEach(button => {
+        button.disabled = alertBusy;
+    });
+    if (state) setLogState(state);
+}
+function logEntryHtml(entry) {
+    return '<div class="log-entry ' + escapeHtml(entry.level || "") +
+        '"><span class="log-time">' + escapeHtml(entry.time || "") +
+        '</span><span class="log-message">' + escapeHtml(entry.message || "") +
+        '</span></div>';
+}
+function renderLogs(logs) {
+    seenLogIds.clear();
+    const status = document.getElementById("status");
+    if (!logs || !logs.length) {
+        status.innerHTML = '<div class="log-empty">No alerts recorded in this session.</div>';
+        return;
+    }
+    logs.forEach(entry => { if (entry.id) seenLogIds.add(entry.id); });
+    status.innerHTML = logs.map(logEntryHtml).join("");
+}
+function addLogEntry(entry, state) {
+    if (!entry) return;
+    if (entry.id) {
+        if (seenLogIds.has(entry.id)) {
+            if (state) setLogState(state);
+            return;
+        }
+        seenLogIds.add(entry.id);
+    }
+    const status = document.getElementById("status");
+    const empty = status.querySelector(".log-empty");
+    if (empty) empty.remove();
+    status.insertAdjacentHTML("afterbegin", logEntryHtml(entry));
+    if (state) setLogState(state);
+}
+function addLog(message, level) {
+    addLogEntry({
+        time: new Date().toLocaleTimeString([], {
+            hour: "2-digit", minute: "2-digit", second: "2-digit"
+        }),
+        message: message,
+        level: level
+    });
+}
+function applyConfiguration(data) {
+    if (!data) return;
+    if (data.cctv_ip != null) document.getElementById("cctv_ip").value = data.cctv_ip;
+    if (data.duration != null) {
+        document.getElementById("duration").value = data.duration;
+        alertConfiguration.duration = Number(data.duration);
+    }
+    if (Array.isArray(data.recipients)) {
+        document.querySelectorAll(".recipient-slot").forEach((input, index) => {
+            input.value = data.recipients[index] || "";
+        });
+        alertConfiguration.recipient = data.recipients.filter(Boolean).join(",");
+    }
+    if (data.message != null) document.getElementById("message").value = data.message;
+    if (data.busy != null) {
+        setAlertBusy(data.busy, data.busy ? "Working" : (data.state || "Ready"));
+    }
+}
+window.toggleConfiguration = function() {
+    document.getElementById("configuration").classList.toggle("open");
+};
+function resetSmsTemplate() {
+    document.getElementById("message").value = defaultSmsTemplate;
+}
+function saveConfiguration(event) {
+    event.preventDefault();
+    const cctv_ip = document.getElementById("cctv_ip").value.trim();
+    const duration = Number(document.getElementById("duration").value);
+    const recipient = Array.from(document.querySelectorAll(".recipient-slot"))
+        .map(input => input.value.trim())
+        .filter(Boolean)
+        .join(",");
+    const message = document.getElementById("message").value;
+
+    fetch("/configuration", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({cctv_ip, duration, recipient, message})
+    }).then(response => response.json().then(data => {
+        if (!response.ok) throw Error(data.error || ("Server returned HTTP " + response.status));
+        return data;
+    })).then(() => {
+        if (!socketConnected) addLog("[CONFIG] System settings updated successfully.", "success");
+    }).catch(error => {
+        addLog("[CONFIG_ERROR] Failed to save configuration: " + error.message, "error");
+    });
+}
+function clearLog() {
+    renderLogs([]);
+    setLogState("Ready");
+    if (syncSocket && syncSocket.readyState === WebSocket.OPEN) {
+        syncSocket.send(JSON.stringify({type: "clear_logs"}));
+    }
+}
+function triggerAlert(buttonId) {
+    // Client-side guard gives immediate protection against touch/click spam.
+    if (alertBusy) return;
+
+    const category = {1: "Hazard", 2: "Security", 3: "Medical concern"}[buttonId];
+    setAlertBusy(true, "Working");
+
+    // The server performs a second atomic guard, so simultaneous requests from
+    // multiple tabs/devices cannot create multiple active emergency events.
+    fetch("/trigger-alert", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+            button: String(buttonId),
+            duration: alertConfiguration.duration
+        })
+    }).then(async response => {
+        const data = await response.json().catch(() => ({}));
+        if (response.status === 409 && data.busy) {
+            setAlertBusy(true, "Working");
+            return;
+        }
+        if (!response.ok) {
+            throw Error(data.error || ("Server returned HTTP " + response.status));
+        }
+    }).catch(error => {
+        setAlertBusy(false, "Attention");
+        addLog("[ALERT_ERROR] " + category + " alert dispatch failed: " + error.message, "error");
+    });
+}
+function connectSync() {
+    const socket = new WebSocket(
+        (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws"
+    );
+    syncSocket = socket;
+
+    socket.onopen = () => {
+        if (syncSocket === socket) socketConnected = true;
+    };
+    socket.onmessage = event => {
+        if (syncSocket !== socket) return;
+        try {
+            const data = JSON.parse(event.data);
+            if (data.type === "sync") {
+                applyConfiguration(data);
+                renderLogs(data.logs || []);
+                setAlertBusy(Boolean(data.busy), data.busy ? "Working" : (data.state || "Ready"));
+            } else if (data.type === "configuration") {
+                applyConfiguration(data);
+            } else if (data.type === "log") {
+                addLogEntry(data.entry, data.state);
+            } else if (data.type === "alert_state") {
+                setAlertBusy(Boolean(data.busy), data.state || (data.busy ? "Working" : "Ready"));
+            } else if (data.type === "logs_cleared") {
+                renderLogs([]);
+                setLogState(data.state || "Ready");
+            }
+        } catch (error) {
+            addLog("[SOCKET_ERROR] Invalid synchronization message received.", "error");
+        }
+    };
+    socket.onclose = () => {
+        if (syncSocket !== socket) return;
+        socketConnected = false;
+        setTimeout(() => {
+            if (syncSocket === socket) connectSync();
+        }, 1000);
+    };
+    socket.onerror = () => socket.close();
+}
 connectSync();
 </script></body></html>
 """
@@ -538,14 +797,69 @@ VIDEO_DURATION_SECONDS={VIDEO_DURATION_SECONDS}
 VPS_ENDPOINT={PUBLIC_BASE_URL.rstrip('/')}/upload
 VPS_TOKEN={UPLOAD_TOKEN}
 VPS_EVENT_ENDPOINT={PUBLIC_BASE_URL.rstrip('/')}/events/next
+VPS_EVENT_STATUS_ENDPOINT={PUBLIC_BASE_URL.rstrip('/')}/events/status
 VPS_EVENT_TOKEN={EVENT_TOKEN}
 VPS_CONFIG_ENDPOINT={PUBLIC_BASE_URL.rstrip('/')}/worker-config
 VPS_ENV_ENDPOINT={PUBLIC_BASE_URL.rstrip('/')}/worker-env
 RTSP_USER=admin
 RTSP_PASS=password
-POLL_INTERVAL_SECONDS=2
+POLL_INTERVAL_SECONDS=0.25
 """
     return Response(fallback_env, mimetype="text/plain")
+
+
+def _accept_alert(button_id, duration, source):
+    global active_event
+
+    now = time.time()
+    timestamp = datetime.now(MANILA_TIMEZONE).strftime("%Y-%m-%d_%H-%M-%S-%f")
+    event_id = uuid.uuid4().hex
+    video_filename = f"evidence_btn{button_id}_{timestamp}_{event_id[:8]}.mp4"
+
+    event = {
+        "id": event_id,
+        "button": button_id,
+        "duration": duration,
+        "filename": video_filename,
+        "created_at": now,
+        "expires_at": now + duration + ALERT_LOCK_EXTRA_SECONDS,
+        "source": source,
+    }
+
+    with events_lock:
+        # Atomic single-alert gate: the first event wins; concurrent events are rejected.
+        if active_event is not None:
+            return None
+        active_event = event
+        pending_events.append(event)
+        queue_size = len(pending_events)
+
+    category = ALERT_CATEGORIES[button_id]
+    logger.info(
+        "Alert accepted: source=%s event_id=%s button=%s duration=%ss filename=%s queue_size=%s",
+        source,
+        event_id,
+        button_id,
+        duration,
+        video_filename,
+        queue_size,
+    )
+    record_activity(
+        f"[{source.upper()}] {category} emergency accepted. SMS dispatch started and recording worker queued.",
+        "pending",
+        "Working",
+    )
+    broadcast({
+        "type": "alert_state",
+        "busy": True,
+        "active_event": event,
+        "state": "Working",
+    })
+
+    # SMS and recording are independent: video duration/upload can never delay SMS dispatch.
+    dispatch_sms_async(button_id, video_filename)
+    _schedule_alert_expiry(event_id, duration)
+    return event
 
 
 @app.post("/events")
@@ -558,34 +872,21 @@ def create_event():
     if button_id not in {"1", "2", "3"}:
         return jsonify(error="button must be 1, 2, or 3"), 400
 
-    duration = max(1, min(300, int(data.get("duration", VIDEO_DURATION_SECONDS))))
-    
-    # Pre-calculate filename based on server click time
-    now_str = datetime.now(MANILA_TIMEZONE).strftime("%Y-%m-%d_%H-%M-%S")
-    video_filename = f"evidence_btn{button_id}_{now_str}.mp4"
+    try:
+        duration = max(1, min(300, int(data.get("duration", VIDEO_DURATION_SECONDS))))
+    except (TypeError, ValueError):
+        duration = VIDEO_DURATION_SECONDS
 
-    with events_lock:
-        pending_events.append({"button": button_id, "duration": duration, "filename": video_filename})
-        queue_size = len(pending_events)
-        
-    logger.info(
-        "ESP32 event queued: button=%s duration=%ss filename=%s queue_size=%s",
-        button_id,
-        duration,
-        video_filename,
-        queue_size,
-    )
-    category_name = ALERT_CATEGORIES[button_id]
-    record_activity(
-        f"[HARDWARE_SIGNAL] Received {category_name} event from ESP32 device node. Added to recording pipeline queue.", "pending"
-    )
-    
-    send_sms_notification(button_id, video_filename)
-    
-    record_activity(
-        f"[ALERT_DISPATCHED] {category_name} hardware event processed. SMS notifications broadcasted successfully.", "success"
-    )
-    return jsonify(message="Event queued and SMS dispatched"), 202
+    event = _accept_alert(button_id, duration, "hardware_signal")
+    if event is None:
+        logger.warning("Concurrent hardware alert ignored because another alert is active.")
+        return jsonify(message="Alert ignored; another alert is already active.", busy=True), 409
+
+    return jsonify(
+        message="Alert accepted; SMS and recording started independently.",
+        event_id=event["id"],
+        filename=event["filename"],
+    ), 202
 
 
 @app.post("/configuration")
@@ -647,44 +948,28 @@ def save_configuration():
     return jsonify(message="Configuration saved"), 200
 
 
-@app.get("/trigger-alert")
+@app.post("/trigger-alert")
 def trigger_alert():
-    button_id = request.args.get("button", "")
+    data = request.get_json(silent=True) or {}
+    button_id = str(data.get("button", "")).strip()
     if button_id not in {"1", "2", "3"}:
-        return "Invalid alert button", 400
+        return jsonify(error="button must be 1, 2, or 3"), 400
 
-    duration = max(
-        1, min(300, int(request.args.get("duration", VIDEO_DURATION_SECONDS)))
-    )
-    
-    # Pre-calculate filename based on web console click time
-    now_str = datetime.now(MANILA_TIMEZONE).strftime("%Y-%m-%d_%H-%M-%S")
-    video_filename = f"evidence_btn{button_id}_{now_str}.mp4"
+    try:
+        duration = max(1, min(300, int(data.get("duration", VIDEO_DURATION_SECONDS))))
+    except (TypeError, ValueError):
+        duration = VIDEO_DURATION_SECONDS
 
-    with events_lock:
-        pending_events.append({"button": button_id, "duration": duration, "filename": video_filename})
-        queue_size = len(pending_events)
-        
-    recipients = recipient_list(TARGET_MOBILE)
-    category = ALERT_CATEGORIES[button_id]
-    logger.info(
-        "Website alert queued: button=%s duration=%ss filename=%s queue_size=%s recipients=%s",
-        button_id,
-        duration,
-        video_filename,
-        queue_size,
-        recipients,
-    )
-    record_activity(
-        f"[WEB_TRIGGER] {category} emergency requested via web console. Target CCTV recording worker activated.",
-        "pending",
-        "Working",
-    )
+    event = _accept_alert(button_id, duration, "web_trigger")
+    if event is None:
+        logger.warning("Concurrent web alert ignored because another alert is active.")
+        return jsonify(error="Another alert is already active.", busy=True), 409
 
-    send_sms_notification(button_id, video_filename)
-
-    record_activity(f"[ALERT_SUCCESS] {category} alert sequence accepted. Emergency protocols initiated.", "success", "Ready")
-    return "Alert queued; the phone worker will record and upload the video.", 202
+    return jsonify(
+        message="Alert accepted; SMS and recording started independently.",
+        event_id=event["id"],
+        filename=event["filename"],
+    ), 202
 
 
 @app.get("/events/next")
@@ -697,23 +982,100 @@ def next_event():
             return jsonify(event=None), 200
         event = pending_events.pop(0)
         queue_size = len(pending_events)
+
     logger.info(
-        "Event delivered to phone worker: event=%s queue_size=%s", event, queue_size
+        "Event delivered to phone worker: event_id=%s queue_size=%s",
+        event.get("id"),
+        queue_size,
     )
     return jsonify(event=event), 200
 
 
+@app.post("/events/status")
+def event_status():
+    if not has_token(EVENT_TOKEN):
+        return jsonify(error="Unauthorized"), 401
+
+    data = request.get_json(silent=True) or {}
+    event_id = str(data.get("event_id", "")).strip()
+    status = str(data.get("status", "")).strip().lower()
+    error = str(data.get("error", "")).strip()
+
+    allowed_statuses = {
+        "received",
+        "recording_started",
+        "recording_complete",
+        "upload_started",
+        "completed",
+        "failed",
+    }
+    if not event_id or status not in allowed_statuses:
+        return jsonify(error="event_id and a valid status are required"), 400
+
+    with events_lock:
+        current_event = dict(active_event) if active_event else None
+
+    if current_event is None or current_event.get("id") != event_id:
+        return jsonify(message="Event is no longer active.", active=False), 200
+
+    category = ALERT_CATEGORIES.get(current_event.get("button"), "Alert")
+
+    if status == "received":
+        record_activity(
+            f"[WORKER_SYNC] {category} event received by the recording worker.",
+            "pending",
+        )
+    elif status == "recording_started":
+        record_activity(
+            f"[RECORDING] {category} CCTV capture started.",
+            "pending",
+            "Recording",
+        )
+    elif status == "recording_complete":
+        record_activity(
+            f"[RECORDING] {category} CCTV capture completed.",
+            "success",
+            "Uploading",
+        )
+    elif status == "upload_started":
+        record_activity(
+            f"[MEDIA_UPLOAD] {category} video upload started.",
+            "pending",
+            "Uploading",
+        )
+    elif status == "completed":
+        record_activity(
+            f"[ALERT_COMPLETE] {category} alert sequence completed; video is available.",
+            "success",
+            "Ready",
+        )
+        _clear_active_event(event_id, "Ready")
+    elif status == "failed":
+        detail = f": {error}" if error else ""
+        record_activity(
+            f"[ALERT_ERROR] {category} alert sequence failed{detail}",
+            "error",
+            "Ready",
+        )
+        _clear_active_event(event_id, "Ready")
+
+    return jsonify(message="Status synchronized.", active=True), 200
+
+
 @sock.route("/ws")
 def websocket(ws):
+    client_lock = threading.Lock()
     with clients_lock:
-        clients.add(ws)
+        clients[ws] = client_lock
+
     try:
-        with send_lock:
+        with client_lock:
             ws.send(
                 json.dumps(
                     {"type": "sync", **configuration_payload(), **activity_snapshot()}
                 )
             )
+
         while True:
             raw = ws.receive()
             if raw is None:
@@ -728,449 +1090,7 @@ def websocket(ws):
         pass
     finally:
         with clients_lock:
-            clients.discard(ws)
-
-
-PASTEBIN_PAGE = r"""
-<!doctype html>
-<html>
-<head>
-    <title>ELMS</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <style>
-        * { box-sizing: border-box; }
-        html, body { margin: 0; padding: 0; height: 100%; background: #fff; }
-        #paste { position: fixed; inset: 0; width: 100%; height: 100%; overflow-y: auto; border: none; outline: none; background: #fff; color: #000; font: 14px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; padding: 10px; white-space: pre-wrap; word-wrap: break-word; }
-        #paste:empty::before { content: attr(data-placeholder); color: #999; pointer-events: none; }
-        #paste img { max-width: 100%; height: auto; display: block; margin: 6px 0; border: 1px solid #000; }
-        #paste img.img-selected { outline: 2px solid #0078d4; outline-offset: 1px; }
-        .resize-handle { position: fixed; width: 12px; height: 12px; background: #0078d4; border: 1px solid #fff; box-sizing: border-box; cursor: se-resize; z-index: 2; touch-action: none; }
-        .bar { position: fixed; right: 3px; bottom: 3px; display: flex; gap: 6px; z-index: 1; }
-        button { padding: 2px 4px; border: 1px solid #000; background: #fff; color: #000; font: inherit; font-size: 12px; cursor: pointer; }
-        #status { position: fixed; left: 3px; bottom: 3px; font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: #666; z-index: 1; }
-        #paste.drag-over { background: #f0f0f0; }
-    </style>
-</head>
-<body>
-    <div id="paste" contenteditable="true" spellcheck="false" data-placeholder="Paste or type here... (images can be pasted or dropped too)"></div>
-    <div id="status"></div>
-    <div class="bar">
-        <button onclick="copyText()">Copy</button>
-    </div>
-<script>
-const area = document.getElementById("paste");
-const status = document.getElementById("status");
-let socket = null;
-let saveTimer = null;
-let savedFadeTimer = null;
-let reconnectTimer = null;
-let pageCaching = false;
-
-function setStatus(text) {
-    clearTimeout(savedFadeTimer);
-    status.textContent = text;
-}
-
-// --- HTML sanitization -----------------------------------------------
-// The editor is contenteditable, and its markup gets synced verbatim to
-// every connected client and written straight into innerHTML there. To
-// keep that from becoming an XSS vector (e.g. someone pasting rich HTML
-// from another site, or a rogue client talking to the websocket directly),
-// every piece of HTML is sanitized down to an allowlist before it is
-// rendered anywhere: plain text, <br>, <div> (Chrome wraps lines in these),
-// and <img> whose src points at our own uploaded-image endpoint. Anything
-// else is unwrapped to its plain text content.
-function sanitizeHtml(html) {
-    const template = document.createElement("template");
-    template.innerHTML = html;
-    sanitizeChildren(template.content);
-    return template.innerHTML;
-}
-
-function sanitizeChildren(node) {
-    for (const child of Array.from(node.childNodes)) {
-        if (child.nodeType === Node.TEXT_NODE) continue;
-        if (child.nodeType !== Node.ELEMENT_NODE) { child.remove(); continue; }
-
-        const tag = child.tagName.toLowerCase();
-        if (tag === "img") {
-            const src = child.getAttribute("src") || "";
-            if (!/^\/pastebin-image\//.test(src)) { child.remove(); continue; }
-            // Preserve a user-set width (from the resize handle) but only
-            // ever as a bare "width:<number>px;" value, never raw style text,
-            // so this can't be used to smuggle arbitrary CSS.
-            const style = child.getAttribute("style") || "";
-            const widthMatch = /^\s*width:\s*(\d+(?:\.\d+)?)px;?\s*$/i.exec(style);
-            for (const attr of Array.from(child.attributes)) {
-                if (attr.name !== "src" && attr.name !== "alt") child.removeAttribute(attr.name);
-            }
-            if (widthMatch) {
-                const width = Math.max(20, Math.min(4000, parseFloat(widthMatch[1])));
-                child.setAttribute("style", `width:${width}px;`);
-            }
-            continue;
-        }
-        if (tag === "br" || tag === "div") {
-            for (const attr of Array.from(child.attributes)) child.removeAttribute(attr.name);
-            sanitizeChildren(child);
-            continue;
-        }
-        // Unknown/disallowed element: keep its text, drop the tag itself.
-        const text = document.createTextNode(child.textContent);
-        child.replaceWith(text);
-    }
-}
-
-function connect() {
-    setStatus("Connecting...");
-    socket = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/pastebin-ws");
-    socket.onopen = () => setStatus("");
-    socket.onmessage = event => {
-        const data = JSON.parse(event.data);
-        if (data.type === "update" && document.activeElement !== area) {
-            deselectImage();
-            area.innerHTML = sanitizeHtml(data.text || "");
-        }
-        if (data.type === "saved") {
-            setStatus("Saved");
-            savedFadeTimer = setTimeout(() => { status.textContent = ""; }, 1200);
-        }
-    };
-    socket.onclose = () => {
-        // If the page is being frozen into the back/forward cache, don't
-        // bother reconnecting - pageshow will reconnect if/when it's restored.
-        if (pageCaching) return;
-        setStatus("Offline, reconnecting...");
-        clearTimeout(reconnectTimer);
-        reconnectTimer = setTimeout(connect, 2000);
-    };
-    socket.onerror = () => socket.close();
-}
-connect();
-
-window.addEventListener("pagehide", event => {
-    if (!event.persisted) return;
-    // Chrome closes any open sockets when caching the page for instant
-    // back/forward navigation; close it ourselves first to avoid the
-    // "entered Back-Forward Cache" console error, and skip auto-reconnect.
-    pageCaching = true;
-    clearTimeout(reconnectTimer);
-    if (socket) socket.close();
-});
-
-window.addEventListener("pageshow", event => {
-    if (!event.persisted) return;
-    // Page was restored from bfcache; the old socket is dead, reconnect.
-    pageCaching = false;
-    connect();
-});
-
-area.addEventListener("input", () => {
-    setStatus("Syncing...");
-    clearTimeout(saveTimer);
-    saveTimer = setTimeout(sendHtml, 300);
-});
-
-function sendHtml() {
-    if (socket && socket.readyState === WebSocket.OPEN) {
-        setStatus("Saving...");
-        socket.send(JSON.stringify({ type: "update", text: sanitizeHtml(area.innerHTML) }));
-    }
-}
-
-function copyText() {
-    navigator.clipboard.writeText(area.textContent);
-}
-
-// --- Cursor-position insertion -----------------------------------------
-function getEditableRange() {
-    const selection = window.getSelection();
-    if (selection && selection.rangeCount > 0) {
-        const range = selection.getRangeAt(0);
-        if (area.contains(range.commonAncestorContainer)) return range;
-    }
-    // No caret in the editor (e.g. a drop without a prior click): fall
-    // back to the end of the content.
-    const range = document.createRange();
-    range.selectNodeContents(area);
-    range.collapse(false);
-    return range;
-}
-
-function insertNodeAtRange(node, range) {
-    range.deleteContents();
-    range.insertNode(node);
-    range.setStartAfter(node);
-    range.collapse(true);
-    const selection = window.getSelection();
-    selection.removeAllRanges();
-    selection.addRange(range);
-}
-
-function insertTextAtRange(text, range) {
-    insertNodeAtRange(document.createTextNode(text), range);
-}
-
-function insertImageAtRange(url, range) {
-    const img = document.createElement("img");
-    img.src = url;
-    img.alt = "pasted image";
-    insertNodeAtRange(img, range);
-    area.dispatchEvent(new Event("input"));
-}
-
-// --- Image resizing -----------------------------------------------------
-// Click an image to select it and drag the handle at its corner to resize.
-// The handle itself lives outside #paste (so it never gets synced) and is
-// repositioned on scroll/resize while an image stays selected.
-let selectedImg = null;
-let resizeHandle = null;
-let resizeState = null;
-
-function positionHandle() {
-    if (!selectedImg || !resizeHandle) return;
-    const rect = selectedImg.getBoundingClientRect();
-    resizeHandle.style.left = `${rect.right - 6}px`;
-    resizeHandle.style.top = `${rect.bottom - 6}px`;
-}
-
-function selectImage(img) {
-    if (selectedImg === img) return;
-    deselectImage();
-    selectedImg = img;
-    selectedImg.classList.add("img-selected");
-    resizeHandle = document.createElement("div");
-    resizeHandle.className = "resize-handle";
-    document.body.appendChild(resizeHandle);
-    positionHandle();
-    resizeHandle.addEventListener("pointerdown", startResize);
-}
-
-function deselectImage() {
-    if (selectedImg) selectedImg.classList.remove("img-selected");
-    if (resizeHandle) resizeHandle.remove();
-    selectedImg = null;
-    resizeHandle = null;
-}
-
-function startResize(event) {
-    if (!selectedImg) return;
-    event.preventDefault();
-    event.stopPropagation();
-    resizeState = {
-        startX: event.clientX,
-        startWidth: selectedImg.getBoundingClientRect().width,
-    };
-    resizeHandle.setPointerCapture(event.pointerId);
-    resizeHandle.addEventListener("pointermove", onResizeMove);
-    resizeHandle.addEventListener("pointerup", endResize);
-}
-
-function onResizeMove(event) {
-    if (!resizeState || !selectedImg) return;
-    const width = Math.max(20, resizeState.startWidth + (event.clientX - resizeState.startX));
-    selectedImg.style.width = `${Math.round(width)}px`;
-    positionHandle();
-}
-
-function endResize(event) {
-    resizeHandle.releasePointerCapture(event.pointerId);
-    resizeHandle.removeEventListener("pointermove", onResizeMove);
-    resizeHandle.removeEventListener("pointerup", endResize);
-    resizeState = null;
-    area.dispatchEvent(new Event("input"));
-}
-
-area.addEventListener("click", event => {
-    if (event.target.tagName === "IMG" && area.contains(event.target)) {
-        selectImage(event.target);
-    } else {
-        deselectImage();
-    }
-});
-
-document.addEventListener("click", event => {
-    if (event.target === resizeHandle) return;
-    if (!area.contains(event.target)) deselectImage();
-});
-
-area.addEventListener("scroll", positionHandle);
-window.addEventListener("resize", positionHandle);
-window.addEventListener("scroll", positionHandle, true);
-
-const IMAGE_EXTENSION_RE = /\.(png|jpe?g|gif|webp|bmp|avif|svg|heic|heif)$/i;
-
-function isImageFile(file) {
-    if (!file) return false;
-    if (file.type && file.type.startsWith("image/")) return true;
-    // File managers often hand over files with an empty or generic
-    // (e.g. application/octet-stream) type, so fall back to the extension.
-    return IMAGE_EXTENSION_RE.test(file.name || "");
-}
-
-async function uploadImage(file, range) {
-    setStatus("Uploading image...");
-    const formData = new FormData();
-    formData.append("image", file, file.name || "pasted-image.png");
-    try {
-        const response = await fetch("/pastebin-image", { method: "POST", body: formData });
-        if (!response.ok) throw new Error("Upload failed");
-        const data = await response.json();
-        insertImageAtRange(data.url, range);
-        setStatus("");
-    } catch (error) {
-        setStatus("Image upload failed");
-        savedFadeTimer = setTimeout(() => { status.textContent = ""; }, 2000);
-    }
-}
-
-area.addEventListener("paste", event => {
-    const items = event.clipboardData ? event.clipboardData.items : [];
-    for (const item of items) {
-        if (item.kind === "file") {
-            const file = item.getAsFile();
-            if (isImageFile(file)) {
-                event.preventDefault();
-                uploadImage(file, getEditableRange());
-                return;
-            }
-        }
-    }
-    // Plain text paste: insert as literal text, not rich HTML from the
-    // clipboard source, so the editor's content stays within our allowlist.
-    const text = event.clipboardData ? event.clipboardData.getData("text/plain") : "";
-    if (text) {
-        event.preventDefault();
-        insertTextAtRange(text, getEditableRange());
-        area.dispatchEvent(new Event("input"));
-    }
-});
-
-area.addEventListener("dragenter", event => {
-    if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
-    event.preventDefault();
-    area.classList.add("drag-over");
-});
-
-area.addEventListener("dragover", event => {
-    if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
-    event.preventDefault();
-    area.classList.add("drag-over");
-});
-
-area.addEventListener("dragleave", () => {
-    area.classList.remove("drag-over");
-});
-
-function rangeFromPoint(x, y) {
-    if (document.caretRangeFromPoint) {
-        return document.caretRangeFromPoint(x, y);
-    }
-    if (document.caretPositionFromPoint) {
-        const pos = document.caretPositionFromPoint(x, y);
-        if (!pos) return null;
-        const range = document.createRange();
-        range.setStart(pos.offsetNode, pos.offset);
-        range.collapse(true);
-        return range;
-    }
-    return null;
-}
-
-area.addEventListener("drop", event => {
-    event.preventDefault();
-    area.classList.remove("drag-over");
-    const files = event.dataTransfer ? Array.from(event.dataTransfer.files) : [];
-    const images = files.filter(isImageFile);
-    if (images.length) {
-        const dropRange = rangeFromPoint(event.clientX, event.clientY) || getEditableRange();
-        images.forEach(file => uploadImage(file, dropRange.cloneRange()));
-    } else if (files.length) {
-        setStatus("Dropped file isn't a recognized image");
-        savedFadeTimer = setTimeout(() => { status.textContent = ""; }, 2000);
-    }
-});
-</script>
-</body>
-</html>
-"""
-
-
-@app.get("/pastebin")
-def pastebin_page():
-    return render_template_string(PASTEBIN_PAGE, paste_text=paste_text)
-
-
-@app.post("/pastebin-image")
-def pastebin_image_upload():
-    image = request.files.get("image")
-    if image is None or not image.filename:
-        return jsonify(error="Missing image file"), 400
-
-    content_type = (image.mimetype or "").lower()
-    extension = ALLOWED_IMAGE_TYPES.get(content_type)
-    if not extension:
-        guessed = Path(secure_filename(image.filename)).suffix.lower()
-        if guessed in ALLOWED_IMAGE_EXTENSIONS:
-            extension = ".jpg" if guessed == ".jpeg" else guessed
-        else:
-            return jsonify(error="Unsupported image type"), 400
-
-    timestamp = datetime.now(MANILA_TIMEZONE).strftime("%Y%m%d_%H%M%S_%f")
-    filename = f"paste_{timestamp}{extension}"
-    image.save(PASTE_IMAGES_DIR / filename)
-    logger.info("Pastebin image uploaded: file=%s", filename)
-    return jsonify(url=f"/pastebin-image/{filename}"), 201
-
-
-@app.get("/pastebin-image/<path:filename>")
-def pastebin_image_view(filename):
-    safe_filename = Path(filename)
-    if safe_filename.name != filename:
-        abort(404)
-
-    image_path = PASTE_IMAGES_DIR / safe_filename.name
-    if not image_path.is_file():
-        abort(404)
-
-    return send_from_directory(PASTE_IMAGES_DIR, safe_filename.name)
-
-
-@sock.route("/pastebin-ws")
-def pastebin_websocket(ws):
-    global paste_text
-    with paste_clients_lock:
-        paste_clients.add(ws)
-    try:
-        with send_lock:
-            ws.send(json.dumps({"type": "update", "text": paste_text}))
-        while True:
-            raw = ws.receive()
-            if raw is None:
-                break
-            try:
-                data = json.loads(raw)
-            except (TypeError, json.JSONDecodeError):
-                continue
-            if data.get("type") == "update":
-                text = str(data.get("text", ""))
-                with paste_lock:
-                    paste_text = text
-                    try:
-                        PASTE_PATH.write_text(text, encoding="utf-8")
-                    except OSError as error:
-                        logger.warning("Could not save pastebin.txt: %s", error)
-                broadcast_paste({"type": "update", "text": text}, exclude=ws)
-                try:
-                    with send_lock:
-                        ws.send(json.dumps({"type": "saved"}))
-                except Exception:
-                    pass
-    except Exception:
-        pass
-    finally:
-        with paste_clients_lock:
-            paste_clients.discard(ws)
+            clients.pop(ws, None)
 
 
 @app.post("/upload")

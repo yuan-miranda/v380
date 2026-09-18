@@ -82,8 +82,11 @@ FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg")
 VPS_ENDPOINT = os.getenv("VPS_ENDPOINT", "")
 VPS_TOKEN = os.getenv("VPS_TOKEN", "")
 VPS_EVENT_ENDPOINT = os.getenv("VPS_EVENT_ENDPOINT", "")
+VPS_EVENT_STATUS_ENDPOINT = os.getenv("VPS_EVENT_STATUS_ENDPOINT", "")
+if not VPS_EVENT_STATUS_ENDPOINT and VPS_EVENT_ENDPOINT.endswith("/events/next"):
+    VPS_EVENT_STATUS_ENDPOINT = VPS_EVENT_ENDPOINT[:-len("/next")] + "/status"
 VPS_EVENT_TOKEN = os.getenv("VPS_EVENT_TOKEN", VPS_TOKEN)
-POLL_INTERVAL_SECONDS = float(os.getenv("POLL_INTERVAL_SECONDS", "2"))
+POLL_INTERVAL_SECONDS = max(0.1, float(os.getenv("POLL_INTERVAL_SECONDS", "0.25")))
 VIDEO_DURATION_SECONDS = int(os.getenv("VIDEO_DURATION_SECONDS", "60"))
 CCTV_IP = os.getenv("CCTV_IP", "192.168.100.57")
 RTSP_USER = os.getenv("RTSP_USER", "admin")
@@ -160,7 +163,8 @@ def upload_video(filename):
         logger.warning(
             "Upload skipped: endpoint or video file is unavailable: %s", filename
         )
-        return
+        return False
+
     logger.info("Upload started: file=%s endpoint=%s", filename, VPS_ENDPOINT)
     try:
         with open(filename, "rb") as video_file:
@@ -174,31 +178,55 @@ def upload_video(filename):
         logger.info(
             "Upload complete: file=%s status=%s", filename, response.status_code
         )
+        return True
     except requests.RequestException as error:
         logger.error("Upload failed: %s", error)
+        return False
+
 
 
 def process_event(event):
+    event_id = str(event.get("id", "")).strip()
     button_id = str(event.get("button", "unknown"))
+
     try:
         duration = max(1, min(300, int(event.get("duration", VIDEO_DURATION_SECONDS))))
     except (TypeError, ValueError):
         duration = VIDEO_DURATION_SECONDS
 
-    # Prioritize server-provided filename to completely avoid mismatch issues
+    # The server-generated filename is used so the SMS link and uploaded video match exactly.
     server_filename = event.get("filename")
     if server_filename:
         filename = os.path.abspath(server_filename)
     else:
         filename = os.path.abspath(
-            f"evidence_btn{button_id}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.mp4"
+            f"evidence_btn{button_id}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S-%f')}.mp4"
         )
 
-    logger.info("Event received: button=%s duration=%ss filename=%s", button_id, duration, os.path.basename(filename))
-    if record_cctv_stream(filename, duration):
-        upload_video(filename)
-    else:
-        logger.error("Event failed before upload: button=%s", button_id)
+    logger.info(
+        "Event received: id=%s button=%s duration=%ss filename=%s",
+        event_id,
+        button_id,
+        duration,
+        os.path.basename(filename),
+    )
+    report_event_status(event_id, "received")
+
+    report_event_status(event_id, "recording_started")
+    if not record_cctv_stream(filename, duration):
+        report_event_status(event_id, "failed", "CCTV recording failed.")
+        logger.error("Event failed during recording: button=%s", button_id)
+        return
+
+    report_event_status(event_id, "recording_complete")
+    report_event_status(event_id, "upload_started")
+
+    if not upload_video(filename):
+        report_event_status(event_id, "failed", "Video upload failed.")
+        return
+
+    report_event_status(event_id, "completed")
+
 
 
 def poll_events():
