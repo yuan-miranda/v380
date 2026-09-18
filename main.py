@@ -93,6 +93,46 @@ RTSP_USER = os.getenv("RTSP_USER", "admin")
 RTSP_PASS = os.getenv("RTSP_PASS", "password")
 
 
+def report_event_status(event_id, status, error=""):
+    """Best-effort worker status synchronization with the VPS.
+
+    Status reporting must never stop the recording/upload pipeline. The request
+    therefore uses a short timeout and catches all request-level failures.
+    """
+    if not event_id or not VPS_EVENT_STATUS_ENDPOINT:
+        return False
+
+    payload = {
+        "event_id": event_id,
+        "status": status,
+    }
+    if error:
+        payload["error"] = error
+
+    try:
+        response = requests.post(
+            VPS_EVENT_STATUS_ENDPOINT,
+            json=payload,
+            headers={"Authorization": f"Bearer {VPS_EVENT_TOKEN}"},
+            timeout=3,
+        )
+        response.raise_for_status()
+        logger.info(
+            "Event status synchronized: id=%s status=%s",
+            event_id,
+            status,
+        )
+        return True
+    except requests.RequestException as exc:
+        logger.warning(
+            "Event status sync failed: id=%s status=%s error=%s",
+            event_id,
+            status,
+            exc,
+        )
+        return False
+
+
 def get_live_rtsp_url():
     load_local_env()
     current_ip = os.getenv("CCTV_IP", CCTV_IP)
@@ -210,8 +250,6 @@ def process_event(event):
         duration,
         os.path.basename(filename),
     )
-    report_event_status(event_id, "received")
-
     report_event_status(event_id, "recording_started")
     if not record_cctv_stream(filename, duration):
         report_event_status(event_id, "failed", "CCTV recording failed.")
