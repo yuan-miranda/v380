@@ -3,10 +3,8 @@ import logging
 import os
 import shutil
 import subprocess
-import sys
 import threading
 import time
-from urllib.parse import quote
 from datetime import datetime
 from pathlib import Path
 
@@ -25,15 +23,22 @@ DEFAULT_VPS_ENV_ENDPOINT = "http://alerto.ddns.net/worker-env"
 DEFAULT_VPS_EVENT_TOKEN = "qqqq"
 
 
-def load_local_env():
-    if ENV_FILE.is_file():
-        with open(ENV_FILE, encoding="utf-8") as env_file:
-            for line in env_file:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, value = line.split("=", 1)
-                os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+def load_local_env(overwrite=False):
+    if not ENV_FILE.is_file():
+        return
+
+    with open(ENV_FILE, encoding="utf-8") as env_file:
+        for line in env_file:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if overwrite:
+                os.environ[key] = value
+            else:
+                os.environ.setdefault(key, value)
 
 
 load_local_env()
@@ -43,43 +48,55 @@ VPS_EVENT_TOKEN = os.getenv("VPS_EVENT_TOKEN", DEFAULT_VPS_EVENT_TOKEN)
 
 
 def sync_server_env_to_config():
+    """Pull the current server configuration and apply it to this worker.
+
+    The server is authoritative for CCTV_IP.  The returned values are applied
+    directly to os.environ so an old process environment cannot keep an old
+    CCTV address alive after synchronization.
+    """
     try:
         logger.info("Pulling configuration profile from server: %s", VPS_ENV_ENDPOINT)
         response = requests.get(
             VPS_ENV_ENDPOINT,
             headers={"Authorization": f"Bearer {VPS_EVENT_TOKEN}"},
-            timeout=10,
+            timeout=5,
         )
-        if response.status_code == 200:
-            env_text = response.text
-            ENV_FILE.write_text(env_text, encoding="utf-8")
+        response.raise_for_status()
 
-            config_data = {}
-            for line in env_text.splitlines():
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, value = line.split("=", 1)
-                config_data[key.strip()] = value.strip().strip('"').strip("'")
+        env_text = response.text
+        parsed = {}
+        for line in env_text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            parsed[key.strip()] = value.strip().strip('"').strip("'")
 
-            CONFIG_FILE.write_text(json.dumps(config_data, indent=2), encoding="utf-8")
-            logger.info(
-                "Successfully synchronized server config into local config.json."
-            )
-        else:
-            logger.warning(
-                "Server returned status %s during config sync; using local fallback.",
-                response.status_code,
-            )
-    except requests.RequestException as error:
+        if not parsed.get("CCTV_IP"):
+            raise ValueError("Server configuration did not contain CCTV_IP")
+
+        ENV_FILE.write_text(env_text, encoding="utf-8")
+        CONFIG_FILE.write_text(json.dumps(parsed, indent=2), encoding="utf-8")
+
+        # IMPORTANT: replace stale values instead of os.environ.setdefault().
+        os.environ.update(parsed)
+
+        logger.info(
+            "Server configuration synchronized: CCTV_IP=%s duration=%ss",
+            parsed.get("CCTV_IP"),
+            parsed.get("VIDEO_DURATION_SECONDS", ""),
+        )
+        return True
+    except (requests.RequestException, ValueError, OSError) as error:
         logger.warning(
-            "Could not reach server for environment sync: %s. Using local config.",
+            "Could not synchronize server configuration: %s. Keeping current configuration.",
             error,
         )
+        return False
 
 
 sync_server_env_to_config()
-load_local_env()
+load_local_env(overwrite=True)
 
 FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg")
 VPS_ENDPOINT = os.getenv("VPS_ENDPOINT", "")
@@ -91,28 +108,9 @@ if not VPS_EVENT_STATUS_ENDPOINT and VPS_EVENT_ENDPOINT.endswith("/events/next")
 VPS_EVENT_TOKEN = os.getenv("VPS_EVENT_TOKEN", VPS_TOKEN)
 POLL_INTERVAL_SECONDS = max(0.1, float(os.getenv("POLL_INTERVAL_SECONDS", "0.25")))
 VIDEO_DURATION_SECONDS = int(os.getenv("VIDEO_DURATION_SECONDS", "60"))
+CCTV_IP = os.getenv("CCTV_IP", "192.168.100.57")
 RTSP_USER = os.getenv("RTSP_USER", "admin")
 RTSP_PASS = os.getenv("RTSP_PASS", "password")
-CCTV_RTSP_URL = os.getenv("CCTV_RTSP_URL", "").strip()
-CCTV_IP = os.getenv("CCTV_IP", "").strip()
-CONFIG_SYNC_INTERVAL_SECONDS = max(30, int(os.getenv("CONFIG_SYNC_INTERVAL_SECONDS", "60")))
-
-
-def background_config_sync():
-    """Refresh server settings without blocking the event polling loop."""
-    while True:
-        time.sleep(CONFIG_SYNC_INTERVAL_SECONDS)
-        try:
-            sync_server_env_to_config()
-            # Keep the manually entered CCTV setting authoritative.
-            if CCTV_RTSP_URL:
-                os.environ["CCTV_RTSP_URL"] = CCTV_RTSP_URL
-                os.environ.pop("CCTV_IP", None)
-            elif CCTV_IP:
-                os.environ["CCTV_IP"] = CCTV_IP
-                os.environ.pop("CCTV_RTSP_URL", None)
-        except Exception as error:
-            logger.warning("Background configuration sync failed: %s", error)
 
 
 def report_event_status(event_id, status, error=""):
@@ -155,98 +153,15 @@ def report_event_status(event_id, status, error=""):
         return False
 
 
-def _save_local_cctv(value):
-    """Persist the manually entered CCTV value without touching server settings."""
-    value = value.strip()
-    if not value:
-        return
-    try:
-        lines = ENV_FILE.read_text(encoding="utf-8").splitlines() if ENV_FILE.is_file() else []
-        filtered = [line for line in lines if not line.lstrip().startswith(("CCTV_RTSP_URL=", "CCTV_IP="))]
-        if value.lower().startswith("rtsp://"):
-            filtered.append(f"CCTV_RTSP_URL={value}")
-        else:
-            filtered.append(f"CCTV_IP={value}")
-        ENV_FILE.write_text("\n".join(filtered) + "\n", encoding="utf-8")
-    except OSError as error:
-        logger.warning("Could not persist CCTV setting locally: %s", error)
+def get_live_rtsp_url(cctv_ip=None):
+    current_ip = str(cctv_ip or os.getenv("CCTV_IP", CCTV_IP)).strip()
+    if not current_ip:
+        raise ValueError("CCTV_IP is empty")
+    return f"rtsp://{RTSP_USER}:{RTSP_PASS}@{current_ip}:554/live/ch00_0"
 
 
-def _get_manual_cctv_setting():
-    load_local_env()
-    url = os.getenv("CCTV_RTSP_URL", "").strip()
-    ip = os.getenv("CCTV_IP", "").strip()
-    return url or ip
-
-
-def get_live_rtsp_url():
-    global CCTV_RTSP_URL, CCTV_IP
-    setting = _get_manual_cctv_setting()
-
-    # A full RTSP URL is preferred because it lets the user specify the camera's
-    # exact path/port/credentials.
-    if setting.lower().startswith("rtsp://"):
-        return setting
-
-    if setting:
-        user = os.getenv("RTSP_USER", RTSP_USER)
-        password = os.getenv("RTSP_PASS", RTSP_PASS)
-        return f"rtsp://{quote(user, safe='')}:{quote(password, safe='')}@{setting}:554/live/ch00_0"
-
-    return ""
-
-
-def configure_cctv():
-    """Ask for the CCTV address once when running interactively.
-
-    No camera discovery is performed. The operator supplies either an IP/host
-    or the complete RTSP URL. An environment value can be used for unattended
-    startup.
-    """
-    global CCTV_RTSP_URL, CCTV_IP
-
-    cli_value = ""
-    if "--cctv" in sys.argv:
-        try:
-            cli_value = sys.argv[sys.argv.index("--cctv") + 1].strip()
-        except (IndexError, AttributeError):
-            logger.error("--cctv requires an IP address or RTSP URL")
-            raise SystemExit(2)
-
-    current = _get_manual_cctv_setting()
-    if cli_value:
-        current = cli_value
-    elif sys.stdin.isatty():
-        # Always let the operator choose the camera address. The value supplied
-        # by the server is only a fallback/default and is never auto-discovered.
-        prompt = "Enter CCTV IP/hostname or full RTSP URL"
-        if current:
-            entered = input(f"{prompt} [{current}]: ").strip()
-            if entered:
-                current = entered
-        else:
-            current = input(f"{prompt}: ").strip()
-
-    if not current:
-        logger.error(
-            "No CCTV address configured. Set CCTV_RTSP_URL/CCTV_IP or run: python main.py --cctv <IP-or-RTSP-URL>"
-        )
-        return False
-
-    if current.lower().startswith("rtsp://"):
-        CCTV_RTSP_URL = current
-        CCTV_IP = ""
-    else:
-        CCTV_IP = current
-        CCTV_RTSP_URL = ""
-
-    _save_local_cctv(current)
-    logger.info("CCTV address configured manually: %s", current)
-    return True
-
-
-def record_cctv_stream(filename, duration_seconds):
-    rtsp_url = get_live_rtsp_url()
+def record_cctv_stream(filename, duration_seconds, cctv_ip=None):
+    rtsp_url = get_live_rtsp_url(cctv_ip)
     if not rtsp_url or shutil.which(FFMPEG_PATH) is None:
         logger.error("Recording skipped: RTSP URL or FFmpeg is unavailable")
         return False
@@ -340,7 +255,6 @@ def process_event(event):
     except (TypeError, ValueError):
         duration = VIDEO_DURATION_SECONDS
 
-    # The server-generated filename is used so the SMS link and uploaded video match exactly.
     server_filename = event.get("filename")
     if server_filename:
         filename = os.path.abspath(server_filename)
@@ -349,17 +263,30 @@ def process_event(event):
             f"evidence_btn{button_id}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S-%f')}.mp4"
         )
 
+    # The event contains the exact CCTV configuration snapshot used when the
+    # alert was accepted. This avoids races if the website configuration changes
+    # while an event is already being processed.
+    event_cctv_ip = str(event.get("cctv_ip", "")).strip()
+    if not event_cctv_ip:
+        event_cctv_ip = os.getenv("CCTV_IP", CCTV_IP).strip()
+
     logger.info(
-        "Event received: id=%s button=%s duration=%ss filename=%s",
+        "Event received: id=%s button=%s duration=%ss filename=%s server_cctv_ip=%s",
         event_id,
         button_id,
         duration,
         os.path.basename(filename),
+        event_cctv_ip,
     )
+
     report_event_status(event_id, "recording_started")
-    if not record_cctv_stream(filename, duration):
+    if not record_cctv_stream(filename, duration, event_cctv_ip):
         report_event_status(event_id, "failed", "CCTV recording failed.")
-        logger.error("Event failed during recording: button=%s", button_id)
+        logger.error(
+            "Event failed during recording: button=%s cctv_ip=%s",
+            button_id,
+            event_cctv_ip,
+        )
         return
 
     report_event_status(event_id, "recording_complete")
@@ -371,6 +298,12 @@ def process_event(event):
 
     report_event_status(event_id, "completed")
 
+
+def _configuration_sync_loop():
+    """Refresh configuration without blocking event polling."""
+    while True:
+        time.sleep(10)
+        sync_server_env_to_config()
 
 
 def poll_events():
@@ -385,15 +318,9 @@ def poll_events():
     )
     headers = {"Authorization": f"Bearer {VPS_EVENT_TOKEN}"}
 
-    poll_counter = 0
     while True:
         try:
-            poll_counter += 1
-            if poll_counter >= 4:
-                sync_server_env_to_config()
-                poll_counter = 0
-
-            response = requests.get(VPS_EVENT_ENDPOINT, headers=headers, timeout=15)
+            response = requests.get(VPS_EVENT_ENDPOINT, headers=headers, timeout=5)
             response.raise_for_status()
             event = response.json().get("event")
             if event:
@@ -404,5 +331,6 @@ def poll_events():
 
 
 if __name__ == "__main__":
+    threading.Thread(target=_configuration_sync_loop, name="config-sync", daemon=True).start()
     logger.info("ALERTO video worker started")
     poll_events()

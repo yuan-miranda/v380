@@ -788,11 +788,10 @@ def worker_env():
     if not has_token(EVENT_TOKEN):
         return jsonify(error="Unauthorized"), 401
 
-    env_path = Path(__file__).resolve().with_name(".env")
-    if env_path.is_file():
-        return Response(env_path.read_text(encoding="utf-8"), mimetype="text/plain")
-
-    fallback_env = f"""CCTV_IP={CCTV_IP}
+    # Always generate the worker profile from the server's CURRENT runtime
+    # configuration. Do not return a stale server-side .env file, because the
+    # website may have changed CCTV_IP after that file was created.
+    env_text = f"""CCTV_IP={CCTV_IP}
 VIDEO_DURATION_SECONDS={VIDEO_DURATION_SECONDS}
 VPS_ENDPOINT={PUBLIC_BASE_URL.rstrip('/')}/upload
 VPS_TOKEN={UPLOAD_TOKEN}
@@ -805,7 +804,12 @@ RTSP_USER=admin
 RTSP_PASS=password
 POLL_INTERVAL_SECONDS=0.25
 """
-    return Response(fallback_env, mimetype="text/plain")
+    logger.info(
+        "Worker configuration requested: CCTV_IP=%s duration=%ss",
+        CCTV_IP,
+        VIDEO_DURATION_SECONDS,
+    )
+    return Response(env_text, mimetype="text/plain")
 
 
 def _accept_alert(button_id, duration, source):
@@ -821,6 +825,10 @@ def _accept_alert(button_id, duration, source):
         "button": button_id,
         "duration": duration,
         "filename": video_filename,
+        # Snapshot the exact CCTV configuration used for this alert.
+        # The worker uses this value for FFmpeg, so a later config change
+        # cannot cause the event to record from a different camera.
+        "cctv_ip": CCTV_IP,
         "created_at": now,
         "expires_at": now + duration + ALERT_LOCK_EXTRA_SECONDS,
         "source": source,
