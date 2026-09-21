@@ -84,6 +84,14 @@ events_lock = threading.Lock()
 # Condition lets the worker wait for an event instead of polling an empty queue.
 events_condition = threading.Condition(events_lock)
 
+# Relay commands for the ESP32. The ESP32 long-polls /relay/next, just like the phone worker does with /events/next.
+relay_commands = []
+relay_condition = threading.Condition()
+MAX_RELAY_QUEUE = 20
+RELAY_COMMAND_TTL_SECONDS = 60  # stale commands are dropped instead of firing late
+MAX_RELAY_DURATION_SECONDS = 3600
+MAX_RELAY_BEEPS = 50
+
 # Each WebSocket has its own send lock so one slow client cannot serialize all clients.
 clients = {}
 clients_lock = threading.Lock()
@@ -1077,6 +1085,122 @@ def event_status():
         _clear_active_event(event_id, "Ready")
 
     return jsonify(message="Status synchronized.", active=True), 200
+
+
+def _parse_power(value):
+    """Accept true/false, 1/0, "on"/"off". Returns None if it can't be understood."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"1", "true", "on", "yes"}:
+            return True
+        if text in {"0", "false", "off", "no"}:
+            return False
+    return None
+
+
+def _queue_relay_command(command, description):
+    with relay_condition:
+        relay_commands.append(command)
+        del relay_commands[:-MAX_RELAY_QUEUE]
+        relay_condition.notify_all()
+    logger.info("Relay command queued: %s", command)
+    record_activity(f"[RELAY] {description} queued for the ESP32.", "pending")
+    return jsonify(message="Relay command queued.", command=command), 202
+
+
+@app.post("/relay")
+def create_relay_command():
+    """Queue a relay command. Two forms:
+
+    1) Simple on/off:   {"power": true, "duration": 10}
+       power    - true = relay ON, false = relay OFF
+       duration - seconds to hold that state, then the ESP32 flips back.
+                  0 (or omitted) = hold until the next command.
+
+    2) Beep pattern:    {"beeps": 3, "on": 1, "off": 1}
+       beeps - how many times to ring (1-50)
+       on    - seconds the relay is ON for each beep  (0.05-60, default 1)
+       off   - seconds of silence between beeps       (0.05-60, default 1)
+       The whole pattern is sent in ONE command and timed by the ESP32 itself,
+       so the beeps are evenly spaced. Patterns queue up: the ESP32 finishes
+       one before it asks for the next.
+    """
+    if not has_token(EVENT_TOKEN):
+        return jsonify(error="Unauthorized"), 401
+
+    data = request.get_json(silent=True) or {}
+
+    if "beeps" in data:
+        try:
+            beeps = int(data.get("beeps"))
+            on_seconds = float(data.get("on", 1))
+            off_seconds = float(data.get("off", 1))
+        except (TypeError, ValueError):
+            return jsonify(error="beeps must be a whole number; on/off must be seconds"), 400
+        beeps = max(1, min(MAX_RELAY_BEEPS, beeps))
+        on_seconds = round(max(0.05, min(60.0, on_seconds)), 3)
+        off_seconds = round(max(0.05, min(60.0, off_seconds)), 3)
+        command = {
+            "id": uuid.uuid4().hex,
+            "beeps": beeps,
+            "on_seconds": on_seconds,
+            "off_seconds": off_seconds,
+            "created_at": time.time(),
+        }
+        return _queue_relay_command(
+            command, f"Beep pattern ({beeps}x, {on_seconds}s on / {off_seconds}s off)"
+        )
+
+    power = _parse_power(data.get("power"))
+    if power is None:
+        return jsonify(error="send either power (true/false) or beeps (number)"), 400
+
+    try:
+        duration = int(data.get("duration", 0))
+    except (TypeError, ValueError):
+        return jsonify(error="duration must be a number of seconds"), 400
+    duration = max(0, min(MAX_RELAY_DURATION_SECONDS, duration))
+
+    command = {
+        "id": uuid.uuid4().hex,
+        "power": power,
+        "duration": duration,
+        "created_at": time.time(),
+    }
+    hold = f"for {duration}s" if duration else "until the next command"
+    return _queue_relay_command(command, f"Relay {'ON' if power else 'OFF'} {hold}")
+
+
+@app.get("/relay/next")
+def next_relay_command():
+    if not has_token(EVENT_TOKEN):
+        return jsonify(error="Unauthorized"), 401
+
+    # Long-poll: wakes immediately when a command is queued, returns null after `wait` seconds.
+    wait_seconds = min(max(request.args.get("wait", default=20, type=float), 0.0), 30.0)
+    deadline = time.time() + wait_seconds
+
+    with relay_condition:
+        while True:
+            now = time.time()
+            # Drop stale commands so a delayed ESP32 never fires an old request.
+            relay_commands[:] = [
+                c for c in relay_commands if now - c["created_at"] <= RELAY_COMMAND_TTL_SECONDS
+            ]
+            if relay_commands:
+                command = relay_commands.pop(0)
+                break
+            remaining = deadline - now
+            if remaining <= 0:
+                return jsonify(command=None), 200
+            relay_condition.wait(timeout=remaining)
+
+    logger.info("Relay command delivered to ESP32: id=%s", command["id"])
+    return jsonify(command=command), 200
 
 
 @sock.route("/ws")
