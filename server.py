@@ -473,6 +473,7 @@ WEB_PAGE = """
         button { width: 100%; height: clamp(160px, 38vw, 220px); padding: 18px; font-size: clamp(21px, 6vw, 28px); color: white; border: none; border-radius: 0; cursor: pointer; font-weight: 700; box-shadow: none; transition: transform 0.1s ease, opacity 0.2s; touch-action: manipulation; }
         button:active { transform: scale(0.98); opacity: 0.9; } button:disabled { opacity: 0.45; cursor: not-allowed; transform: none; }
         .btn-hazard { background: #d97706; } .btn-security { background: #b91c1c; } .btn-medical { background: #047857; }
+        .btn-disarm { background: #1e293b; height: auto; min-height: 0; padding: 16px; font-size: clamp(16px, 4.5vw, 20px); }
         .activity-log { width: 100%; max-width: 34rem; margin: 24px auto 0; border: 1px solid #cbd5e1; background: #ffffff; text-align: left; }
         .log-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 12px 14px; border-bottom: 1px solid #e2e8f0; color: #1e293b; font-size: 13px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; }
         .log-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
@@ -499,7 +500,7 @@ WEB_PAGE = """
 <body>
     <div class="container">
         <h2>{{ product_name }}</h2><p class="subtitle">Emergency Reporting System</p>
-        <div class="button-stack"><button class="btn-hazard" onclick="triggerAlert(1)">Hazard</button><button class="btn-security" onclick="triggerAlert(2)">Security</button><button class="btn-medical" onclick="triggerAlert(3)">Medical Concern</button></div>
+        <div class="button-stack"><button class="btn-hazard" onclick="triggerAlert(1)">Hazard</button><button class="btn-security" onclick="triggerAlert(2)">Security</button><button class="btn-medical" onclick="triggerAlert(3)">Medical Concern</button><button class="btn-disarm" type="button" onclick="disarmAlarm()">Disarm Alarm</button></div>
         <section class="activity-log"><div class="log-header"><span>Activity log</span><div class="log-actions"><button class="log-action" id="log-state" type="button" disabled>Ready</button><button class="log-action" type="button" onclick="clearLog()">Clear log</button><button class="log-action" type="button" onclick="document.getElementById('configuration').classList.toggle('open')">Configuration</button></div></div><div id="status"><div class="log-empty">No alerts recorded in this session.</div></div></section>
         <form class="configuration" id="configuration" onsubmit="saveConfiguration(event)">
             <label for="cctv_ip">CCTV IP Address</label>
@@ -667,6 +668,19 @@ function triggerAlert(buttonId) {
         setAlertBusy(false, "Attention");
         addLog("[ALERT_ERROR] " + category + " alert dispatch failed: " + error.message, "error");
     });
+}
+function disarmAlarm() {
+    // Not gated on alertBusy: the alarm can be silenced any time it's sounding,
+    // independent of whether SMS/recording are still in progress.
+    fetch("/disarm-alarm", { method: "POST" })
+        .then(async response => {
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) throw Error(data.error || ("Server returned HTTP " + response.status));
+            addLog("[ALARM] Disarm command sent.", "success");
+        })
+        .catch(error => {
+            addLog("[ALARM_ERROR] Failed to disarm alarm: " + error.message, "error");
+        });
 }
 function connectSync() {
     const socket = new WebSocket(
@@ -878,7 +892,35 @@ def _accept_alert(button_id, duration, source):
     # SMS and recording are independent: video duration/upload can never delay SMS dispatch.
     dispatch_sms_async(button_id, video_filename)
     _schedule_alert_expiry(event_id, duration)
+    _queue_alarm_for_button(button_id)
     return event
+
+
+def _queue_alarm_for_button(button_id):
+    """Fire the ESP32 relay/buzzer according to the category of the alert.
+
+    Hazard (1)   -> beep every 5s, for 30s total (6 short beeps, 1s on / 4s off)
+    Security (2) -> relay held ON continuously for 30s, no beeping
+    Medical (3)  -> no alarm
+    """
+    if button_id == "1":
+        command = {
+            "id": uuid.uuid4().hex,
+            "beeps": 6,
+            "on_seconds": 1.0,
+            "off_seconds": 4.0,
+            "created_at": time.time(),
+        }
+        _queue_relay_command(command, "Hazard alarm (beep every 5s for 30s)")
+    elif button_id == "2":
+        command = {
+            "id": uuid.uuid4().hex,
+            "power": True,
+            "duration": 30,
+            "created_at": time.time(),
+        }
+        _queue_relay_command(command, "Security alarm (continuous 30s)")
+    # button_id == "3" (Medical Concern): no alarm.
 
 
 @app.post("/events")
@@ -1110,6 +1152,20 @@ def _queue_relay_command(command, description):
     logger.info("Relay command queued: %s", command)
     record_activity(f"[RELAY] {description} queued for the ESP32.", "pending")
     return jsonify(message="Relay command queued.", command=command), 202
+
+
+@app.post("/disarm-alarm")
+def disarm_alarm():
+    """Public endpoint for the web page's Disarm button: immediately cuts the
+    relay, interrupting a beep pattern or a continuous-on alarm mid-way."""
+    command = {
+        "id": uuid.uuid4().hex,
+        "power": False,
+        "duration": 0,
+        "created_at": time.time(),
+    }
+    _queue_relay_command(command, "Alarm manually disarmed from the web app")
+    return jsonify(message="Disarm command queued."), 202
 
 
 @app.post("/relay")

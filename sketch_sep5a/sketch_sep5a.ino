@@ -19,7 +19,7 @@ unsigned long debounceDelay = 50;
 
 // ---------------- Relay ----------------
 const int RELAY_PIN = 18;
-const bool RELAY_ACTIVE_LOW = false;   // set true if your relay module triggers on LOW
+const bool RELAY_ACTIVE_LOW = true;   // set true if your relay module triggers on LOW
 const int RELAY_POLL_WAIT_SECONDS = 20; // long-poll: server holds the request until a command arrives
 
 portMUX_TYPE relayMux = portMUX_INITIALIZER_UNLOCKED;
