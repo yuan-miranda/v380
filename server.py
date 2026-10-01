@@ -693,8 +693,10 @@ function _clearArmedButton() {
 }
 
 function triggerAlert(buttonId) {
-    // Client-side guard: blocks clicks when fully busy (alarm fired / medical active).
-    if (alertBusy) return;
+    // Block the click only when fully busy AND this isn't the button waiting for its second press.
+    // When alertBusy=true comes from the server's alert_state broadcast after a physical first press,
+    // the armed button must still be clickable for the second press to fire the alarm.
+    if (alertBusy && _armedButtonId !== buttonId) return;
 
     const labels = {1: "Hazard", 2: "Security", 3: "Medical Concern"};
     const category = labels[buttonId] || "Alert";
