@@ -197,7 +197,7 @@ void relayListenerTask(void* param) {
     }
 
     HTTPClient http;
-    http.begin(String("http://") + serverHost + "/relay/next?wait=" + RELAY_POLL_WAIT_SECONDS);
+    http.begin(String("http://") + serverHost + "/relay/next?wait=" + RELAY_POLL_WAIT_SECONDS + "&token=" + eventToken);
     http.setTimeout((RELAY_POLL_WAIT_SECONDS + 10) * 1000);
     http.addHeader("Authorization", String("Bearer ") + eventToken);
 
@@ -218,7 +218,7 @@ void relayListenerTask(void* param) {
         }
         HTTPClient cancelHttp;
         // wait=1 so we don't block long; re-check the pattern after each poll.
-        cancelHttp.begin(String("http://") + serverHost + "/relay/next?wait=1");
+        cancelHttp.begin(String("http://") + serverHost + "/relay/next?wait=1&token=" + eventToken);
         cancelHttp.setTimeout(5000);
         cancelHttp.addHeader("Authorization", String("Bearer ") + eventToken);
         int cancelCode = cancelHttp.GET();

@@ -1363,7 +1363,14 @@ def create_relay_command():
 
 @app.get("/relay/next")
 def next_relay_command():
-    if not has_token(EVENT_TOKEN):
+    # Accept token from header OR ?token= query param.
+    # Nginx often strips the Authorization header on GET requests (proxy_pass
+    # default behaviour), so the ESP32 falls back to the query param.
+    query_token = request.args.get("token", "")
+    token_ok = has_token(EVENT_TOKEN) or (
+        bool(EVENT_TOKEN) and query_token == EVENT_TOKEN
+    )
+    if not token_ok:
         return jsonify(error="Unauthorized"), 401
 
     # Long-poll: wakes immediately when a command is queued, returns null after `wait` seconds.
