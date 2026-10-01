@@ -7,9 +7,7 @@ const char* password = "Xd4AjFnJ";
 const char* serverHost = "alerto.ddns.net";
 const char* eventToken = "qqqq";
 
-// 18 pin
-
-const int buttonPins[] = {15, 16, 17};
+const int buttonPins[] = {19, 18, 17};
 const int numButtons = 3;
 
 int buttonState[numButtons];
@@ -18,7 +16,7 @@ unsigned long lastDebounceTime[numButtons];
 unsigned long debounceDelay = 50;
 
 // ---------------- Relay ----------------
-const int RELAY_PIN = 18;
+const int RELAY_PIN = 16;
 const bool RELAY_ACTIVE_LOW = true;   // set true if your relay module triggers on LOW
 const int RELAY_POLL_WAIT_SECONDS = 20; // long-poll: server holds the request until a command arrives
 
@@ -210,9 +208,30 @@ void relayListenerTask(void* param) {
       http.end();
       handleRelayPayload(payload);  // {"command":null} on timeout -> ignored
 
-      // Let a beep pattern finish before asking for the next command, so several
-      // queued patterns play one after another instead of cutting each other off.
+      // While a beep pattern is running, keep polling the server with a short
+      // wait so a disarm (or any new) command can interrupt it immediately.
+      // Before this fix the ESP32 was stuck here and never picked up the disarm.
       while (relayPatternRunning()) {
+        if (WiFi.status() != WL_CONNECTED) {
+          vTaskDelay(pdMS_TO_TICKS(200));
+          continue;
+        }
+        HTTPClient cancelHttp;
+        // wait=1 so we don't block long; re-check the pattern after each poll.
+        cancelHttp.begin(String("http://") + serverHost + "/relay/next?wait=1");
+        cancelHttp.setTimeout(5000);
+        cancelHttp.addHeader("Authorization", String("Bearer ") + eventToken);
+        int cancelCode = cancelHttp.GET();
+        if (cancelCode == 200) {
+          String cancelPayload = cancelHttp.getString();
+          cancelHttp.end();
+          // If a disarm arrived, handleRelayPayload calls relayControl(false,0)
+          // which sets patternActive=false, breaking this loop on the next tick.
+          handleRelayPayload(cancelPayload);
+        } else {
+          cancelHttp.end();
+        }
+        // Yield so the main loop (relayUpdate) keeps stepping the pattern state.
         vTaskDelay(pdMS_TO_TICKS(50));
       }
     } else {
