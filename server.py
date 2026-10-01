@@ -546,11 +546,28 @@ function escapeHtml(value) {
 function setLogState(state) {
     document.getElementById("log-state").innerText = state || "Ready";
 }
+// Map button IDs to their CSS class so we can identify them without changing HTML.
+const BUTTON_CLASS = {1: "btn-hazard", 2: "btn-security", 3: "btn-medical"};
+
+function _updateButtonStates() {
+    document.querySelectorAll(".button-stack button").forEach(button => {
+        // Disarm button is NEVER disabled — always reachable.
+        if (button.classList.contains("btn-disarm")) {
+            button.disabled = false;
+            return;
+        }
+        if (_armedButtonId !== null) {
+            // Arm window active: only the armed button stays clickable.
+            // The other alert buttons are locked so you can't arm a different one.
+            button.disabled = !button.classList.contains(BUTTON_CLASS[_armedButtonId]);
+        } else {
+            button.disabled = alertBusy;
+        }
+    });
+}
 function setAlertBusy(busy, state) {
     alertBusy = Boolean(busy);
-    document.querySelectorAll(".button-stack button").forEach(button => {
-        button.disabled = alertBusy;
-    });
+    _updateButtonStates();
     if (state) setLogState(state);
 }
 function logEntryHtml(entry) {
@@ -647,37 +664,51 @@ function clearLog() {
         syncSocket.send(JSON.stringify({type: "clear_logs"}));
     }
 }
-// Double-press alarm state tracked in the browser (mirrors server logic).
-// The server is authoritative; this is just for immediate visual feedback.
-const _armWindow = {};      // buttonId -> expiry timestamp (ms)
+// ---- Arm-window state for double-press alarm ----
+// Tracks which single button is currently waiting for its second press.
+let _armedButtonId = null;  // null | 1 | 2 | 3
+let _armTimer = null;
 const ARM_WINDOW_MS = 10000;
 
-function isArmed() {
-    // Returns true if any button is currently armed (within its 10s second-press window).
-    const now = Date.now();
-    return Object.values(_armWindow).some(expiry => now < expiry);
+function isArmed() { return _armedButtonId !== null; }
+
+function _setArmedButton(buttonId) {
+    _armedButtonId = buttonId;
+    clearTimeout(_armTimer);
+    // Auto-expire: when the 10s window closes without a second press,
+    // re-lock the buttons (server is still busy with the active event).
+    _armTimer = setTimeout(() => {
+        _armedButtonId = null;
+        _armTimer = null;
+        _updateButtonStates(); // go back to alertBusy-controlled state
+        setLogState("Working"); // server still processing the event
+    }, ARM_WINDOW_MS);
+    _updateButtonStates();
+}
+
+function _clearArmedButton() {
+    _armedButtonId = null;
+    clearTimeout(_armTimer);
+    _armTimer = null;
 }
 
 function triggerAlert(buttonId) {
-    // Client-side guard gives immediate protection against touch/click spam.
+    // Client-side guard: blocks clicks when fully busy (alarm fired / medical active).
     if (alertBusy) return;
 
     const labels = {1: "Hazard", 2: "Security", 3: "Medical Concern"};
     const category = labels[buttonId] || "Alert";
 
     if (buttonId === 3) {
-        // Medical: lock busy immediately, no double-press needed.
+        // Medical: lock all buttons immediately (no double-press).
         setAlertBusy(true, "Working");
     } else {
-        // Red / Orange: pre-arm the 10s window NOW, before sending the fetch.
-        // The server's WebSocket broadcast (alert_state busy=true) can arrive
-        // before the fetch .then() resolves, so isArmed() must already be true
-        // when that message lands, otherwise the buttons would get locked.
-        _armWindow[buttonId] = Date.now() + ARM_WINDOW_MS;
+        // Red / Orange: pre-arm NOW before the fetch, so the WebSocket
+        // "alert_state busy=true" broadcast can't race ahead and lock buttons.
+        // _setArmedButton disables the other two alert buttons and keeps this one enabled.
+        _setArmedButton(buttonId);
     }
 
-    // The server performs a second atomic guard, so simultaneous requests from
-    // multiple tabs/devices cannot create multiple active emergency events.
     fetch("/trigger-alert", {
         method: "POST",
         headers: {"Content-Type": "application/json"},
@@ -688,31 +719,30 @@ function triggerAlert(buttonId) {
     }).then(async response => {
         const data = await response.json().catch(() => ({}));
         if (response.status === 409 && data.busy) {
-            // Another alert is active; clear arm window and lock normally.
-            delete _armWindow[buttonId];
+            // Another alert already active; give up arm window and lock.
+            _clearArmedButton();
             setAlertBusy(true, "Working");
             return;
         }
         if (!response.ok) {
-            // Unexpected error; clear arm window so future clicks work.
-            delete _armWindow[buttonId];
+            _clearArmedButton();
             throw Error(data.error || ("Server returned HTTP " + response.status));
         }
         if (data.alarm) {
-            // Second press confirmed: alarm is now firing.
-            // Clear arm window and explicitly lock buttons.
-            delete _armWindow[buttonId];
+            // Second press confirmed: alarm firing.
+            // Clear arm window, lock all alert buttons (Disarm stays enabled).
+            _clearArmedButton();
             setAlertBusy(true, "Alarm");
             addLog("[ALARM] " + category + " alarm triggered!", "error");
             setLogState("Alarm");
         } else {
-            // First press accepted: arm window already set above.
-            // Buttons stay enabled for the second press.
+            // First press accepted: arm window already started above.
+            // Only this button is enabled; the other two are disabled.
             addLog("[ALERT] " + category + " SMS sent. Press again within 10s to trigger the alarm.", "pending");
             setLogState("Armed – " + category);
         }
     }).catch(error => {
-        delete _armWindow[buttonId];
+        _clearArmedButton();
         if (buttonId === 3) setAlertBusy(false, "Attention");
         addLog("[ALERT_ERROR] " + category + " alert dispatch failed: " + error.message, "error");
     });
