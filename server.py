@@ -92,6 +92,14 @@ RELAY_COMMAND_TTL_SECONDS = 60  # stale commands are dropped instead of firing l
 MAX_RELAY_DURATION_SECONDS = 3600
 MAX_RELAY_BEEPS = 50
 
+# Double-press alarm state: tracks first-press timestamps per button.
+# First press  → SMS + recording, no alarm.
+# Second press within ALARM_ARM_WINDOW_SECONDS → alarm only (no duplicate SMS/recording).
+# Second press after the window → treated as a new first press.
+ALARM_ARM_WINDOW_SECONDS = 10
+_first_press_times = {}   # button_id -> float (time.time() of first press)
+_first_press_lock = threading.Lock()
+
 # Each WebSocket has its own send lock so one slow client cannot serialize all clients.
 clients = {}
 clients_lock = threading.Lock()
@@ -639,12 +647,22 @@ function clearLog() {
         syncSocket.send(JSON.stringify({type: "clear_logs"}));
     }
 }
+// Double-press alarm state tracked in the browser (mirrors server logic).
+// The server is authoritative; this is just for immediate visual feedback.
+const _armWindow = {};      // buttonId -> expiry timestamp (ms)
+const ARM_WINDOW_MS = 10000;
+
 function triggerAlert(buttonId) {
     // Client-side guard gives immediate protection against touch/click spam.
     if (alertBusy) return;
 
-    const category = {1: "Hazard", 2: "Security", 3: "Medical concern"}[buttonId];
-    setAlertBusy(true, "Working");
+    const labels = {1: "Hazard", 2: "Security", 3: "Medical Concern"};
+    const category = labels[buttonId] || "Alert";
+
+    // Medical (3): lock busy immediately like before (no double-press needed).
+    if (buttonId === 3) {
+        setAlertBusy(true, "Working");
+    }
 
     // The server performs a second atomic guard, so simultaneous requests from
     // multiple tabs/devices cannot create multiple active emergency events.
@@ -664,11 +682,23 @@ function triggerAlert(buttonId) {
         if (!response.ok) {
             throw Error(data.error || ("Server returned HTTP " + response.status));
         }
+        if (data.alarm) {
+            // Second press confirmed: alarm is now firing.
+            delete _armWindow[buttonId];
+            addLog("[ALARM] " + category + " alarm triggered!", "error");
+            setLogState("Alarm");
+        } else {
+            // First press: SMS sent, start 10s arm window for this button.
+            _armWindow[buttonId] = Date.now() + ARM_WINDOW_MS;
+            addLog("[ALERT] " + category + " SMS sent. Press again within 10s to trigger the alarm.", "pending");
+            setLogState("Armed – " + category);
+        }
     }).catch(error => {
-        setAlertBusy(false, "Attention");
+        if (buttonId === 3) setAlertBusy(false, "Attention");
         addLog("[ALERT_ERROR] " + category + " alert dispatch failed: " + error.message, "error");
     });
 }
+
 function disarmAlarm() {
     // Not gated on alertBusy: the alarm can be silenced any time it's sounding,
     // independent of whether SMS/recording are still in progress.
@@ -892,35 +922,99 @@ def _accept_alert(button_id, duration, source):
     # SMS and recording are independent: video duration/upload can never delay SMS dispatch.
     dispatch_sms_async(button_id, video_filename)
     _schedule_alert_expiry(event_id, duration)
-    _queue_alarm_for_button(button_id)
+    # NOTE: The alarm (relay) is NOT fired here. It is only fired on a second press
+    # within ALARM_ARM_WINDOW_SECONDS via _handle_button_press().
     return event
 
 
-def _queue_alarm_for_button(button_id):
-    """Fire the ESP32 relay/buzzer according to the category of the alert.
 
-    Hazard (1)   -> beep every 5s, for 30s total (6 short beeps, 1s on / 4s off)
-    Security (2) -> relay held ON continuously for 30s, no beeping
-    Medical (3)  -> no alarm
+
+def _fire_alarm_for_button(button_id):
+    """Actually trigger the ESP32 relay/buzzer for the given button category.
+
+    Orange / Hazard (1)  -> intermittent bell: 30 short beeps, 0.5s on / 0.5s off
+                            (totals 30 s: 30 × (0.5 on + 0.5 off))
+    Red   / Security (2) -> continuous bell: relay held ON for 30s
+    Green / Medical  (3) -> no alarm ever
     """
     if button_id == "1":
+        # Putol-putol (intermittent): 30 beeps × (0.5s on + 0.5s off) = 30s total
         command = {
             "id": uuid.uuid4().hex,
-            "beeps": 6,
-            "on_seconds": 1.0,
-            "off_seconds": 4.0,
+            "beeps": 30,
+            "on_seconds": 0.5,
+            "off_seconds": 0.5,
             "created_at": time.time(),
         }
-        _queue_relay_command(command, "Hazard alarm (beep every 5s for 30s)")
+        _queue_relay_command(command, "Hazard alarm (intermittent bell, 30s)")
     elif button_id == "2":
+        # Tuloytuloy (continuous): relay ON for 30s
         command = {
             "id": uuid.uuid4().hex,
             "power": True,
             "duration": 30,
             "created_at": time.time(),
         }
-        _queue_relay_command(command, "Security alarm (continuous 30s)")
-    # button_id == "3" (Medical Concern): no alarm.
+        _queue_relay_command(command, "Security alarm (continuous bell, 30s)")
+    # button_id == "3" (Medical): no alarm.
+
+
+def _handle_button_press(button_id, duration, source):
+    """Implement the double-press alarm gate.
+
+    Rules
+    -----
+    Medical (3): First press always → SMS + recording, no alarm ever.
+
+    Security (2) / Hazard (1):
+      * First press   → SMS + recording only, arm a 10-second window.
+      * Second press within the 10-second window → alarm only (relay command).
+        No new SMS or recording is started.
+      * Second press after the window expires → treated as a new first press
+        (SMS + recording, resets the window).
+
+    Returns a dict with keys:
+      sms_and_recording : bool  – whether to create an alert event
+      fire_alarm        : bool  – whether to fire the relay alarm
+      response_event    : dict|None – the accepted event object, or None
+    """
+    now = time.time()
+
+    # Medical always → SMS+recording, never alarm.
+    if button_id == "3":
+        event = _accept_alert(button_id, duration, source)
+        return {"sms_and_recording": True, "fire_alarm": False, "response_event": event}
+
+    with _first_press_lock:
+        first_time = _first_press_times.get(button_id)
+        within_window = (first_time is not None and now - first_time <= ALARM_ARM_WINDOW_SECONDS)
+
+        if within_window:
+            # Second press: fire the alarm, clear the window, do NOT re-send SMS/recording.
+            del _first_press_times[button_id]
+            return {"sms_and_recording": False, "fire_alarm": True, "response_event": None}
+        else:
+            if first_time is not None:
+                # Window expired; log that it timed out before they pressed again.
+                category = ALERT_CATEGORIES.get(button_id, "Alert")
+                record_activity(
+                    f"[ALARM_WINDOW] {category} 10-second alarm window expired. New alert started.",
+                    "pending",
+                )
+            # First press (or window expired): SMS + recording, arm the window.
+            _first_press_times[button_id] = now
+
+    # Attempt to create the alert (SMS + recording).
+    event = _accept_alert(button_id, duration, source)
+    if event is not None:
+        category = ALERT_CATEGORIES.get(button_id, "Alert")
+        record_activity(
+            f"[ALARM_ARMED] {category} alert armed. Press the button again within {ALARM_ARM_WINDOW_SECONDS}s to trigger the alarm.",
+            "pending",
+        )
+    return {"sms_and_recording": True, "fire_alarm": False, "response_event": event}
+
+
 
 
 @app.post("/events")
@@ -938,13 +1032,21 @@ def create_event():
     except (TypeError, ValueError):
         duration = VIDEO_DURATION_SECONDS
 
-    event = _accept_alert(button_id, duration, "hardware_signal")
+    result = _handle_button_press(button_id, duration, "hardware_signal")
+
+    if result["fire_alarm"]:
+        # Second press within the window: trigger the alarm relay.
+        _fire_alarm_for_button(button_id)
+        return jsonify(message="Alarm triggered.", alarm=True), 202
+
+    event = result["response_event"]
     if event is None:
+        # First press was blocked because another alert is already active.
         logger.warning("Concurrent hardware alert ignored because another alert is active.")
         return jsonify(message="Alert ignored; another alert is already active.", busy=True), 409
 
     return jsonify(
-        message="Alert accepted; SMS and recording started independently.",
+        message="Alert accepted; SMS and recording started. Press again within 10s to trigger the alarm.",
         event_id=event["id"],
         filename=event["filename"],
     ), 202
@@ -1021,13 +1123,20 @@ def trigger_alert():
     except (TypeError, ValueError):
         duration = VIDEO_DURATION_SECONDS
 
-    event = _accept_alert(button_id, duration, "web_trigger")
+    result = _handle_button_press(button_id, duration, "web_trigger")
+
+    if result["fire_alarm"]:
+        # Second click within the 10s window: trigger the alarm relay only.
+        _fire_alarm_for_button(button_id)
+        return jsonify(message="Alarm triggered.", alarm=True), 202
+
+    event = result["response_event"]
     if event is None:
         logger.warning("Concurrent web alert ignored because another alert is active.")
         return jsonify(error="Another alert is already active.", busy=True), 409
 
     return jsonify(
-        message="Alert accepted; SMS and recording started independently.",
+        message="Alert accepted; SMS and recording started. Click again within 10s to trigger the alarm.",
         event_id=event["id"],
         filename=event["filename"],
     ), 202
