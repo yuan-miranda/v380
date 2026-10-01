@@ -786,6 +786,19 @@ function connectSync() {
             } else if (data.type === "alert_state") {
                 // Don't lock the buttons while we're waiting for a second press in the arm window.
                 if (!isArmed()) setAlertBusy(Boolean(data.busy), data.state || (data.busy ? "Working" : "Ready"));
+            } else if (data.type === "alert_armed") {
+                // First press received (from any source: web or physical button).
+                // Show the armed state: only that button stays clickable, others locked.
+                const btnId = Number(data.button);
+                _clearArmedButton();
+                _setArmedButton(btnId);
+                const labels = {1: "Hazard", 2: "Security", 3: "Medical Concern"};
+                setLogState("Armed – " + (labels[btnId] || "Alert"));
+            } else if (data.type === "alert_alarm_fired") {
+                // Second press fired the alarm (from any source).
+                // Clear arm window and lock all alert buttons; Disarm stays enabled.
+                _clearArmedButton();
+                setAlertBusy(true, "Alarm");
             } else if (data.type === "logs_cleared") {
                 renderLogs([]);
                 setLogState(data.state || "Ready");
@@ -1009,6 +1022,14 @@ def _fire_alarm_for_button(button_id):
         _queue_relay_command(command, "Security alarm (continuous bell, 30s)")
     # button_id == "3" (Medical): no alarm.
 
+    # Notify all web clients that the alarm has fired so they can lock buttons
+    # and show the correct state even if triggered from a physical button.
+    if button_id in {"1", "2"}:
+        broadcast({
+            "type": "alert_alarm_fired",
+            "button": button_id,
+        })
+
 
 def _handle_button_press(button_id, duration, source):
     """Implement the double-press alarm gate.
@@ -1063,6 +1084,13 @@ def _handle_button_press(button_id, duration, source):
             f"[ALARM_ARMED] {category} alert armed. Press the button again within {ALARM_ARM_WINDOW_SECONDS}s to trigger the alarm.",
             "pending",
         )
+        # Tell all web clients which button is now armed so they show the correct
+        # visual state even when the first press came from a physical button.
+        broadcast({
+            "type": "alert_armed",
+            "button": button_id,
+            "window_seconds": ALARM_ARM_WINDOW_SECONDS,
+        })
     return {"sms_and_recording": True, "fire_alarm": False, "response_event": event}
 
 
