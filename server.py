@@ -665,9 +665,15 @@ function triggerAlert(buttonId) {
     const labels = {1: "Hazard", 2: "Security", 3: "Medical Concern"};
     const category = labels[buttonId] || "Alert";
 
-    // Medical (3): lock busy immediately like before (no double-press needed).
     if (buttonId === 3) {
+        // Medical: lock busy immediately, no double-press needed.
         setAlertBusy(true, "Working");
+    } else {
+        // Red / Orange: pre-arm the 10s window NOW, before sending the fetch.
+        // The server's WebSocket broadcast (alert_state busy=true) can arrive
+        // before the fetch .then() resolves, so isArmed() must already be true
+        // when that message lands, otherwise the buttons would get locked.
+        _armWindow[buttonId] = Date.now() + ARM_WINDOW_MS;
     }
 
     // The server performs a second atomic guard, so simultaneous requests from
@@ -682,24 +688,31 @@ function triggerAlert(buttonId) {
     }).then(async response => {
         const data = await response.json().catch(() => ({}));
         if (response.status === 409 && data.busy) {
+            // Another alert is active; clear arm window and lock normally.
+            delete _armWindow[buttonId];
             setAlertBusy(true, "Working");
             return;
         }
         if (!response.ok) {
+            // Unexpected error; clear arm window so future clicks work.
+            delete _armWindow[buttonId];
             throw Error(data.error || ("Server returned HTTP " + response.status));
         }
         if (data.alarm) {
             // Second press confirmed: alarm is now firing.
+            // Clear arm window and explicitly lock buttons.
             delete _armWindow[buttonId];
+            setAlertBusy(true, "Alarm");
             addLog("[ALARM] " + category + " alarm triggered!", "error");
             setLogState("Alarm");
         } else {
-            // First press: SMS sent, start 10s arm window for this button.
-            _armWindow[buttonId] = Date.now() + ARM_WINDOW_MS;
+            // First press accepted: arm window already set above.
+            // Buttons stay enabled for the second press.
             addLog("[ALERT] " + category + " SMS sent. Press again within 10s to trigger the alarm.", "pending");
             setLogState("Armed – " + category);
         }
     }).catch(error => {
+        delete _armWindow[buttonId];
         if (buttonId === 3) setAlertBusy(false, "Attention");
         addLog("[ALERT_ERROR] " + category + " alert dispatch failed: " + error.message, "error");
     });
