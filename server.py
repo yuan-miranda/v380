@@ -652,6 +652,12 @@ function clearLog() {
 const _armWindow = {};      // buttonId -> expiry timestamp (ms)
 const ARM_WINDOW_MS = 10000;
 
+function isArmed() {
+    // Returns true if any button is currently armed (within its 10s second-press window).
+    const now = Date.now();
+    return Object.values(_armWindow).some(expiry => now < expiry);
+}
+
 function triggerAlert(buttonId) {
     // Client-side guard gives immediate protection against touch/click spam.
     if (alertBusy) return;
@@ -728,13 +734,15 @@ function connectSync() {
             if (data.type === "sync") {
                 applyConfiguration(data);
                 renderLogs(data.logs || []);
-                setAlertBusy(Boolean(data.busy), data.busy ? "Working" : (data.state || "Ready"));
+                // Don't lock if we're in the armed window waiting for a second press.
+                if (!isArmed()) setAlertBusy(Boolean(data.busy), data.busy ? "Working" : (data.state || "Ready"));
             } else if (data.type === "configuration") {
                 applyConfiguration(data);
             } else if (data.type === "log") {
                 addLogEntry(data.entry, data.state);
             } else if (data.type === "alert_state") {
-                setAlertBusy(Boolean(data.busy), data.state || (data.busy ? "Working" : "Ready"));
+                // Don't lock the buttons while we're waiting for a second press in the arm window.
+                if (!isArmed()) setAlertBusy(Boolean(data.busy), data.state || (data.busy ? "Working" : "Ready"));
             } else if (data.type === "logs_cleared") {
                 renderLogs([]);
                 setLogState(data.state || "Ready");
