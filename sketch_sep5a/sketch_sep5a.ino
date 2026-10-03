@@ -265,7 +265,7 @@ void setup() {
   for (int i = 0; i < numButtons; i++) {
     pinMode(buttonPins[i], INPUT_PULLUP);
     buttonState[i] = digitalRead(buttonPins[i]);
-    lastButtonState[i] = HIGH;
+    lastButtonState[i] = buttonState[i];
     lastDebounceTime[i] = 0;
     pressStartTime[i] = 0;
     holdTriggered[i] = false;
@@ -308,26 +308,27 @@ void loop() {
     if ((millis() - lastDebounceTime[i]) > debounceDelay) {
       if (reading != buttonState[i]) {
         buttonState[i] = reading;
-        if (buttonState[i] == LOW) {
-          // Button pressed down
+        if (buttonState[i] == HIGH) {
+          // Button pressed down (circuit opened / pin goes HIGH)
           pressStartTime[i] = millis();
           holdTriggered[i] = false;
         } else {
-          // Button released
-          if (!holdTriggered[i]) {
+          // Button released back to resting state (pin goes LOW)
+          if (pressStartTime[i] > 0 && !holdTriggered[i]) {
             int buttonNumber = i + 1;
             Serial.print("Button ");
             Serial.print(buttonNumber);
-            Serial.println(" clicked! Sending event to VPS...");
+            Serial.println(" clicked (short press)! Sending event to VPS...");
             sendButtonEvent(buttonNumber, false);
           }
+          pressStartTime[i] = 0;
           holdTriggered[i] = false;
         }
       }
     }
 
-    // Check for 2.5s hold while button is held down (LOW)
-    if (buttonState[i] == LOW && !holdTriggered[i]) {
+    // Check for 2.5s hold while button is held down (HIGH)
+    if (buttonState[i] == HIGH && pressStartTime[i] > 0 && !holdTriggered[i]) {
       if ((millis() - pressStartTime[i]) >= HOLD_DURATION_MS) {
         holdTriggered[i] = true;
         int buttonNumber = i + 1;

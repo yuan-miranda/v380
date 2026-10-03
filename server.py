@@ -673,7 +673,7 @@ function clearLog() {
 // ---- Arm-window state for hold-to-alarm ----
 let _armedButtonId = null;  // null | 1 | 2 | 3
 let _armTimer = null;
-const ARM_WINDOW_MS = 30000;
+const ARM_WINDOW_MS = 20000;
 const HOLD_DURATION_MS = 2500;
 
 let holdTimer = null;
@@ -1110,23 +1110,16 @@ def _fire_alarm_for_button(button_id):
 
 
 def _handle_button_press(button_id, duration, source, is_hold=False):
-    """Implement the hold-to-alarm gate.
-
-    Rules
-    -----
-    Medical (3): First press always → SMS + recording, no alarm ever.
-
-    Security (2) / Hazard (1):
-      * First press (short click) → SMS + recording only, arm a 30-second window.
-      * Second action within 30-second window:
-        - 2.5s hold (is_hold=True) → fire alarm relay.
-        - Quick click (is_hold=False) → ignore alarm, require 2.5s hold.
-      * 2.5s hold (is_hold=True) at any time → fire alarm relay!
+    """Implement strict 2-step hold-to-alarm parity:
+    1. First action MUST be a single click (is_hold=False) → SMS + recording, arms a 20s window.
+    2. Second action MUST be a 2.5s hold (is_hold=True) WITHIN the 20s window → fires alarm relay.
     """
     now = time.time()
 
     # Medical always → SMS+recording, never alarm.
     if button_id == "3":
+        if is_hold:
+            return {"sms_and_recording": False, "fire_alarm": False, "response_event": None, "hold_required": False}
         event = _accept_alert(button_id, duration, source)
         return {"sms_and_recording": True, "fire_alarm": False, "response_event": event, "hold_required": False}
 
@@ -1136,7 +1129,7 @@ def _handle_button_press(button_id, duration, source, is_hold=False):
 
         if within_window:
             if is_hold:
-                # 2.5s hold confirmed while armed: fire the alarm!
+                # 2.5s hold confirmed within the 20s window: fire the alarm!
                 del _first_press_times[button_id]
                 return {"sms_and_recording": False, "fire_alarm": True, "response_event": None, "hold_required": False}
             else:
@@ -1147,18 +1140,23 @@ def _handle_button_press(button_id, duration, source, is_hold=False):
                     "pending",
                 )
                 return {"sms_and_recording": False, "fire_alarm": False, "response_event": None, "hold_required": True}
+        else:
+            # System is NOT armed (or arm window expired).
+            # A 2.5s hold when NOT armed cannot trigger alarm or arm system!
+            if is_hold:
+                return {"sms_and_recording": False, "fire_alarm": False, "response_event": None, "hold_required": False}
 
-    # If is_hold is True (2.5s hold) even if not currently pre-armed:
-    if is_hold:
-        event = _accept_alert(button_id, duration, source)
-        with _first_press_lock:
-            _first_press_times.pop(button_id, None)
-        return {"sms_and_recording": (event is not None), "fire_alarm": True, "response_event": event, "hold_required": False}
+            # System is NOT armed and this is a single click (is_hold=False).
+            with events_lock:
+                if active_event is not None:
+                    return {"sms_and_recording": False, "fire_alarm": False, "response_event": None, "hold_required": False}
 
-    # System is NOT armed and is_hold is False (short click).
-    with events_lock:
-        if active_event is not None:
-            return {"sms_and_recording": False, "fire_alarm": False, "response_event": None, "hold_required": False}
+            if first_time is not None:
+                category = ALERT_CATEGORIES.get(button_id, "Alert")
+                record_activity(
+                    f"[ALARM_WINDOW] {category} 20-second alarm window expired.",
+                    "pending",
+                )
 
     # Attempt to create the alert (SMS + recording) for a short click.
     event = _accept_alert(button_id, duration, source)
