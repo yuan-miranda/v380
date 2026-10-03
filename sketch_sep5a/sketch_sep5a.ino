@@ -14,6 +14,9 @@ int buttonState[numButtons];
 int lastButtonState[numButtons];
 unsigned long lastDebounceTime[numButtons];
 unsigned long debounceDelay = 50;
+unsigned long pressStartTime[numButtons] = {0, 0, 0};
+bool holdTriggered[numButtons] = {false, false, false};
+const unsigned long HOLD_DURATION_MS = 2500;
 
 // ---------------- Relay ----------------
 const int RELAY_PIN = 16;
@@ -264,10 +267,32 @@ void setup() {
     buttonState[i] = digitalRead(buttonPins[i]);
     lastButtonState[i] = HIGH;
     lastDebounceTime[i] = 0;
+    pressStartTime[i] = 0;
+    holdTriggered[i] = false;
   }
 
   xTaskCreatePinnedToCore(relayListenerTask, "relayListener", 8192, NULL, 1, NULL, 0);
   Serial.println("Listening to server for relay commands...");
+}
+
+void sendButtonEvent(int buttonNumber, bool isHold) {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    String url = String("http://") + serverHost + "/events";
+    http.begin(url);
+    http.addHeader("Authorization", String("Bearer ") + eventToken);
+    http.addHeader("Content-Type", "application/json");
+    String body = String("{\"button\":\"") + buttonNumber + "\",\"hold\":" + (isHold ? "true" : "false") + "}";
+    int httpResponseCode = http.POST(body);
+    if (httpResponseCode > 0) {
+      Serial.print("Server Response Code: ");
+      Serial.println(httpResponseCode);
+    } else {
+      Serial.print("HTTP Error: ");
+      Serial.println(httpResponseCode);
+    }
+    http.end();
+  }
 }
 
 void loop() {
@@ -282,37 +307,37 @@ void loop() {
 
     if ((millis() - lastDebounceTime[i]) > debounceDelay) {
       if (reading != buttonState[i]) {
-        if (buttonState[i] == LOW && reading == HIGH) {
-          int buttonNumber = i + 1;
-          
-          Serial.print("Button ");
-          Serial.print(buttonNumber);
-          Serial.println(" clicked! Sending event to VPS...");
-
-          if (WiFi.status() == WL_CONNECTED) {
-            HTTPClient http;
-            
-            String url = String("http://") + serverHost + "/events";
-            
-            http.begin(url);
-            http.addHeader("Authorization", String("Bearer ") + eventToken);
-            http.addHeader("Content-Type", "application/json");
-            String body = String("{\"button\":\"") + buttonNumber + "\"}";
-            int httpResponseCode = http.POST(body);
-            
-            if (httpResponseCode > 0) {
-              Serial.print("Server Response Code: ");
-              Serial.println(httpResponseCode);
-            } else {
-              Serial.print("HTTP Error: ");
-              Serial.println(httpResponseCode);
-            }
-            http.end();
-          }
-        }
         buttonState[i] = reading;
+        if (buttonState[i] == LOW) {
+          // Button pressed down
+          pressStartTime[i] = millis();
+          holdTriggered[i] = false;
+        } else {
+          // Button released
+          if (!holdTriggered[i]) {
+            int buttonNumber = i + 1;
+            Serial.print("Button ");
+            Serial.print(buttonNumber);
+            Serial.println(" clicked! Sending event to VPS...");
+            sendButtonEvent(buttonNumber, false);
+          }
+          holdTriggered[i] = false;
+        }
       }
     }
+
+    // Check for 2.5s hold while button is held down (LOW)
+    if (buttonState[i] == LOW && !holdTriggered[i]) {
+      if ((millis() - pressStartTime[i]) >= HOLD_DURATION_MS) {
+        holdTriggered[i] = true;
+        int buttonNumber = i + 1;
+        Serial.print("Button ");
+        Serial.print(buttonNumber);
+        Serial.println(" held for 2.5s! Sending hold event to VPS...");
+        sendButtonEvent(buttonNumber, true);
+      }
+    }
+
     lastButtonState[i] = reading;
   }
 }

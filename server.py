@@ -92,11 +92,12 @@ RELAY_COMMAND_TTL_SECONDS = 60  # stale commands are dropped instead of firing l
 MAX_RELAY_DURATION_SECONDS = 3600
 MAX_RELAY_BEEPS = 50
 
-# Double-press alarm state: tracks first-press timestamps per button.
+# Hold-to-alarm state: tracks first-press timestamps per button.
 # First press  → SMS + recording, no alarm.
-# Second press within ALARM_ARM_WINDOW_SECONDS → alarm only (no duplicate SMS/recording).
-# Second press after the window → treated as a new first press.
+# 2.5s hold within ALARM_ARM_WINDOW_SECONDS → alarm only (no duplicate SMS/recording).
+# Press after the window → treated as a new first press.
 ALARM_ARM_WINDOW_SECONDS = 10
+ALARM_HOLD_DURATION_SECONDS = 2.5
 _first_press_times = {}   # button_id -> float (time.time() of first press)
 _first_press_lock = threading.Lock()
 
@@ -478,10 +479,12 @@ WEB_PAGE = """
         h2 { color: #0f172a; margin: 0 0 8px; font-family: Georgia, "Times New Roman", serif; font-size: clamp(28px, 7vw, 38px); font-weight: 700; line-height: 1.1; }
         .subtitle { color: #64748b; margin: 0 0 30px; font-size: 14px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; }
         .button-stack { display: flex; flex-direction: column; gap: 16px; width: 100%; max-width: 34rem; margin: 0 auto; }
-        button { width: 100%; height: clamp(160px, 38vw, 220px); padding: 18px; font-size: clamp(21px, 6vw, 28px); color: white; border: none; border-radius: 0; cursor: pointer; font-weight: 700; box-shadow: none; transition: transform 0.1s ease, opacity 0.2s; touch-action: manipulation; }
+        button { position: relative; overflow: hidden; width: 100%; height: clamp(160px, 38vw, 220px); padding: 18px; font-size: clamp(21px, 6vw, 28px); color: white; border: none; border-radius: 0; cursor: pointer; font-weight: 700; box-shadow: none; transition: transform 0.1s ease, opacity 0.2s; touch-action: manipulation; }
         button:active { transform: scale(0.98); opacity: 0.9; } button:disabled { opacity: 0.45; cursor: not-allowed; transform: none; }
         .btn-hazard { background: #d97706; } .btn-security { background: #b91c1c; } .btn-medical { background: #047857; }
         .btn-disarm { background: #1e293b; height: auto; min-height: 0; padding: 16px; font-size: clamp(16px, 4.5vw, 20px); }
+        .hold-progress { position: absolute; bottom: 0; left: 0; height: 100%; background: rgba(0, 0, 0, 0.35); width: 0%; pointer-events: none; transition: width 0.05s linear; }
+        .armed-badge { display: block; font-size: 13px; font-weight: 600; margin-top: 6px; opacity: 0.95; text-transform: uppercase; letter-spacing: 0.05em; }
         .activity-log { width: 100%; max-width: 34rem; margin: 24px auto 0; border: 1px solid #cbd5e1; background: #ffffff; text-align: left; }
         .log-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 12px 14px; border-bottom: 1px solid #e2e8f0; color: #1e293b; font-size: 13px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; }
         .log-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
@@ -508,7 +511,7 @@ WEB_PAGE = """
 <body>
     <div class="container">
         <h2>{{ product_name }}</h2><p class="subtitle">Emergency Reporting System</p>
-        <div class="button-stack"><button class="btn-hazard" onclick="triggerAlert(1)">Hazard</button><button class="btn-security" onclick="triggerAlert(2)">Security</button><button class="btn-medical" onclick="triggerAlert(3)">Medical Concern</button><button class="btn-disarm" type="button" onclick="disarmAlarm()">Disarm Alarm</button></div>
+        <div class="button-stack"><button class="btn-hazard" id="btn-1" type="button"><span class="btn-label">Hazard</span><span class="armed-badge" id="badge-1"></span><div class="hold-progress" id="progress-1"></div></button><button class="btn-security" id="btn-2" type="button"><span class="btn-label">Security</span><span class="armed-badge" id="badge-2"></span><div class="hold-progress" id="progress-2"></div></button><button class="btn-medical" id="btn-3" type="button"><span class="btn-label">Medical Concern</span><span class="armed-badge" id="badge-3"></span><div class="hold-progress" id="progress-3"></div></button><button class="btn-disarm" type="button" onclick="disarmAlarm()">Disarm Alarm</button></div>
         <section class="activity-log"><div class="log-header"><span>Activity log</span><div class="log-actions"><button class="log-action" id="log-state" type="button" disabled>Ready</button><button class="log-action" type="button" onclick="clearLog()">Clear log</button><button class="log-action" type="button" onclick="document.getElementById('configuration').classList.toggle('open')">Configuration</button></div></div><div id="status"><div class="log-empty">No alerts recorded in this session.</div></div></section>
         <form class="configuration" id="configuration" onsubmit="saveConfiguration(event)">
             <label for="cctv_ip">CCTV IP Address</label>
@@ -528,7 +531,7 @@ WEB_PAGE = """
 <script>
 if ('serviceWorker' in navigator) { window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js')); }
 
-function formatRecipient(input) { let digits = input.value.replace(/\D/g, ""); if (digits.startsWith("63")) digits = "0" + digits.slice(2); if (digits.startsWith("9")) digits = "0" + digits; input.value = digits.slice(0, 11); }
+function formatRecipient(input) { let digits = input.value.replace(/\\D/g, ""); if (digits.startsWith("63")) digits = "0" + digits.slice(2); if (digits.startsWith("9")) digits = "0" + digits; input.value = digits.slice(0, 11); }
 document.querySelectorAll(".recipient-slot").forEach(input => { input.addEventListener("input", () => formatRecipient(input)); input.addEventListener("blur", () => formatRecipient(input)); });
 const alertConfiguration = { duration: Number(document.getElementById("duration").value), recipient: Array.from(document.querySelectorAll(".recipient-slot")).map(input => input.value).filter(Boolean).join(",") };
 const defaultSmsTemplate = {{ default_sms_template | tojson }};
@@ -550,18 +553,21 @@ function setLogState(state) {
 const BUTTON_CLASS = {1: "btn-hazard", 2: "btn-security", 3: "btn-medical"};
 
 function _updateButtonStates() {
-    document.querySelectorAll(".button-stack button").forEach(button => {
-        // Disarm button is NEVER disabled — always reachable.
-        if (button.classList.contains("btn-disarm")) {
-            button.disabled = false;
-            return;
-        }
+    [1, 2, 3].forEach(id => {
+        const btn = document.getElementById("btn-" + id);
+        const badge = document.getElementById("badge-" + id);
+        if (!btn) return;
         if (_armedButtonId !== null) {
-            // Arm window active: only the armed button stays clickable.
-            // The other alert buttons are locked so you can't arm a different one.
-            button.disabled = !button.classList.contains(BUTTON_CLASS[_armedButtonId]);
+            if (_armedButtonId === id) {
+                btn.disabled = false;
+                if (badge) badge.innerText = "Hold 2.5s for Alarm";
+            } else {
+                btn.disabled = true;
+                if (badge) badge.innerText = "";
+            }
         } else {
-            button.disabled = alertBusy;
+            btn.disabled = alertBusy;
+            if (badge) badge.innerText = "";
         }
     });
 }
@@ -664,24 +670,41 @@ function clearLog() {
         syncSocket.send(JSON.stringify({type: "clear_logs"}));
     }
 }
-// ---- Arm-window state for double-press alarm ----
-// Tracks which single button is currently waiting for its second press.
+// ---- Arm-window state for hold-to-alarm ----
 let _armedButtonId = null;  // null | 1 | 2 | 3
 let _armTimer = null;
 const ARM_WINDOW_MS = 10000;
+const HOLD_DURATION_MS = 2500;
+
+let holdTimer = null;
+let holdAnimFrame = null;
+let holdStartTime = 0;
+let isHoldingButton = null;
+let holdTriggered = false;
 
 function isArmed() { return _armedButtonId !== null; }
+
+function _updateHoldProgress(btnId, percent) {
+    const prog = document.getElementById("progress-" + btnId);
+    if (prog) prog.style.width = Math.min(100, Math.max(0, percent)) + "%";
+}
+
+function _resetHoldUI() {
+    if (holdTimer) { clearTimeout(holdTimer); holdTimer = null; }
+    if (holdAnimFrame) { cancelAnimationFrame(holdAnimFrame); holdAnimFrame = null; }
+    [1, 2, 3].forEach(id => _updateHoldProgress(id, 0));
+    isHoldingButton = null;
+    holdTriggered = false;
+}
 
 function _setArmedButton(buttonId) {
     _armedButtonId = buttonId;
     clearTimeout(_armTimer);
-    // Auto-expire: when the 10s window closes without a second press,
-    // re-lock the buttons (server is still busy with the active event).
     _armTimer = setTimeout(() => {
         _armedButtonId = null;
         _armTimer = null;
-        _updateButtonStates(); // go back to alertBusy-controlled state
-        setLogState("Working"); // server still processing the event
+        _updateButtonStates();
+        setLogState("Working");
     }, ARM_WINDOW_MS);
     _updateButtonStates();
 }
@@ -690,24 +713,19 @@ function _clearArmedButton() {
     _armedButtonId = null;
     clearTimeout(_armTimer);
     _armTimer = null;
+    _resetHoldUI();
+    _updateButtonStates();
 }
 
-function triggerAlert(buttonId) {
-    // Block the click only when fully busy AND this isn't the button waiting for its second press.
-    // When alertBusy=true comes from the server's alert_state broadcast after a physical first press,
-    // the armed button must still be clickable for the second press to fire the alarm.
+function triggerAlert(buttonId, isHold = false) {
     if (alertBusy && _armedButtonId !== buttonId) return;
 
     const labels = {1: "Hazard", 2: "Security", 3: "Medical Concern"};
     const category = labels[buttonId] || "Alert";
 
     if (buttonId === 3) {
-        // Medical: lock all buttons immediately (no double-press).
         setAlertBusy(true, "Working");
     } else {
-        // Red / Orange: pre-arm NOW before the fetch, so the WebSocket
-        // "alert_state busy=true" broadcast can't race ahead and lock buttons.
-        // _setArmedButton disables the other two alert buttons and keeps this one enabled.
         _setArmedButton(buttonId);
     }
 
@@ -716,12 +734,12 @@ function triggerAlert(buttonId) {
         headers: {"Content-Type": "application/json"},
         body: JSON.stringify({
             button: String(buttonId),
-            duration: alertConfiguration.duration
+            duration: alertConfiguration.duration,
+            hold: isHold
         })
     }).then(async response => {
         const data = await response.json().catch(() => ({}));
         if (response.status === 409 && data.busy) {
-            // Another alert already active; give up arm window and lock.
             _clearArmedButton();
             setAlertBusy(true, "Working");
             return;
@@ -731,16 +749,14 @@ function triggerAlert(buttonId) {
             throw Error(data.error || ("Server returned HTTP " + response.status));
         }
         if (data.alarm) {
-            // Second press confirmed: alarm firing.
-            // Clear arm window, lock all alert buttons (Disarm stays enabled).
             _clearArmedButton();
             setAlertBusy(true, "Alarm");
-            addLog("[ALARM] " + category + " alarm triggered!", "error");
+            addLog("[ALARM] " + category + " alarm triggered (2.5s hold)!", "error");
             setLogState("Alarm");
+        } else if (data.hold_required) {
+            addLog("[ALARM] " + category + " 2.5s hold required to trigger alarm.", "pending");
         } else {
-            // First press accepted: arm window already started above.
-            // Only this button is enabled; the other two are disabled.
-            addLog("[ALERT] " + category + " SMS sent. Press again within 10s to trigger the alarm.", "pending");
+            addLog("[ALERT] " + category + " SMS sent. Hold button for 2.5s within 10s to trigger alarm.", "pending");
             setLogState("Armed – " + category);
         }
     }).catch(error => {
@@ -750,9 +766,75 @@ function triggerAlert(buttonId) {
     });
 }
 
+function _onButtonPressStart(buttonId, event) {
+    if (event) {
+        if (event.type === 'touchstart') {
+            event.preventDefault();
+        }
+    }
+    const btn = document.getElementById("btn-" + buttonId);
+    if (!btn || btn.disabled) return;
+
+    _resetHoldUI();
+    isHoldingButton = buttonId;
+    holdStartTime = Date.now();
+    holdTriggered = false;
+
+    const currentlyArmed = (_armedButtonId === buttonId);
+
+    if (!currentlyArmed && buttonId !== 3) {
+        triggerAlert(buttonId, false);
+    } else if (buttonId === 3) {
+        triggerAlert(buttonId, false);
+        return;
+    }
+
+    function animateProgress() {
+        if (isHoldingButton !== buttonId) return;
+        const elapsed = Date.now() - holdStartTime;
+        const pct = (elapsed / HOLD_DURATION_MS) * 100;
+        _updateHoldProgress(buttonId, pct);
+        if (elapsed < HOLD_DURATION_MS) {
+            holdAnimFrame = requestAnimationFrame(animateProgress);
+        }
+    }
+    holdAnimFrame = requestAnimationFrame(animateProgress);
+
+    holdTimer = setTimeout(() => {
+        holdTriggered = true;
+        _updateHoldProgress(buttonId, 100);
+        triggerAlert(buttonId, true);
+    }, HOLD_DURATION_MS);
+}
+
+function _onButtonPressEnd(buttonId, event) {
+    if (isHoldingButton !== buttonId) return;
+    const elapsed = Date.now() - holdStartTime;
+    const wasArmed = (_armedButtonId === buttonId);
+
+    if (!holdTriggered && wasArmed && elapsed < HOLD_DURATION_MS) {
+        addLog("[ALARM] Hold button for 2.5s to trigger alarm (double-click ignored).", "pending");
+    }
+    _resetHoldUI();
+}
+
+document.addEventListener("DOMContentLoaded", () => {
+    [1, 2, 3].forEach(id => {
+        const btn = document.getElementById("btn-" + id);
+        if (!btn) return;
+        btn.addEventListener("touchstart", (e) => _onButtonPressStart(id, e), {passive: false});
+        btn.addEventListener("touchend", (e) => _onButtonPressEnd(id, e));
+        btn.addEventListener("touchcancel", (e) => _onButtonPressEnd(id, e));
+        btn.addEventListener("mousedown", (e) => {
+            if (e.button !== 0) return;
+            _onButtonPressStart(id, e);
+        });
+        btn.addEventListener("mouseup", (e) => _onButtonPressEnd(id, e));
+        btn.addEventListener("mouseleave", (e) => _onButtonPressEnd(id, e));
+    });
+});
+
 function disarmAlarm() {
-    // Not gated on alertBusy: the alarm can be silenced any time it's sounding,
-    // independent of whether SMS/recording are still in progress.
     fetch("/disarm-alarm", { method: "POST" })
         .then(async response => {
             const data = await response.json().catch(() => ({}));
@@ -779,26 +861,20 @@ function connectSync() {
             if (data.type === "sync") {
                 applyConfiguration(data);
                 renderLogs(data.logs || []);
-                // Don't lock if we're in the armed window waiting for a second press.
                 if (!isArmed()) setAlertBusy(Boolean(data.busy), data.busy ? "Working" : (data.state || "Ready"));
             } else if (data.type === "configuration") {
                 applyConfiguration(data);
             } else if (data.type === "log") {
                 addLogEntry(data.entry, data.state);
             } else if (data.type === "alert_state") {
-                // Don't lock the buttons while we're waiting for a second press in the arm window.
                 if (!isArmed()) setAlertBusy(Boolean(data.busy), data.state || (data.busy ? "Working" : "Ready"));
             } else if (data.type === "alert_armed") {
-                // First press received (from any source: web or physical button).
-                // Show the armed state: only that button stays clickable, others locked.
                 const btnId = Number(data.button);
                 _clearArmedButton();
                 _setArmedButton(btnId);
                 const labels = {1: "Hazard", 2: "Security", 3: "Medical Concern"};
                 setLogState("Armed – " + (labels[btnId] || "Alert"));
             } else if (data.type === "alert_alarm_fired") {
-                // Second press fired the alarm (from any source).
-                // Clear arm window and lock all alert buttons; Disarm stays enabled.
                 _clearArmedButton();
                 setAlertBusy(true, "Alarm");
             } else if (data.type === "logs_cleared") {
@@ -1033,8 +1109,8 @@ def _fire_alarm_for_button(button_id):
         })
 
 
-def _handle_button_press(button_id, duration, source):
-    """Implement the double-press alarm gate.
+def _handle_button_press(button_id, duration, source, is_hold=False):
+    """Implement the hold-to-alarm gate.
 
     Rules
     -----
@@ -1042,58 +1118,65 @@ def _handle_button_press(button_id, duration, source):
 
     Security (2) / Hazard (1):
       * First press   → SMS + recording only, arm a 10-second window.
-      * Second press within the 10-second window → alarm only (relay command).
-        No new SMS or recording is started.
-      * Second press after the window expires → treated as a new first press
-        (SMS + recording, resets the window).
-
-    Returns a dict with keys:
-      sms_and_recording : bool  – whether to create an alert event
-      fire_alarm        : bool  – whether to fire the relay alarm
-      response_event    : dict|None – the accepted event object, or None
+      * Second action within the 10-second window:
+        - 2.5s hold (is_hold=True) → fire alarm relay.
+        - Quick click (is_hold=False) → ignore alarm, require 2.5s hold.
+      * Press after window expires → treated as a new first press (if system is idle).
     """
     now = time.time()
 
     # Medical always → SMS+recording, never alarm.
     if button_id == "3":
         event = _accept_alert(button_id, duration, source)
-        return {"sms_and_recording": True, "fire_alarm": False, "response_event": event}
+        return {"sms_and_recording": True, "fire_alarm": False, "response_event": event, "hold_required": False}
 
     with _first_press_lock:
         first_time = _first_press_times.get(button_id)
         within_window = (first_time is not None and now - first_time <= ALARM_ARM_WINDOW_SECONDS)
 
         if within_window:
-            # Second press: fire the alarm, clear the window, do NOT re-send SMS/recording.
-            del _first_press_times[button_id]
-            return {"sms_and_recording": False, "fire_alarm": True, "response_event": None}
+            if is_hold:
+                # 2.5s hold confirmed while armed: fire the alarm!
+                del _first_press_times[button_id]
+                return {"sms_and_recording": False, "fire_alarm": True, "response_event": None, "hold_required": False}
+            else:
+                # Quick click while armed: block panic double-click, demand 2.5s hold!
+                category = ALERT_CATEGORIES.get(button_id, "Alert")
+                record_activity(
+                    f"[ALARM_HOLD_REQUIRED] {category} 2.5s hold required to trigger alarm.",
+                    "pending",
+                )
+                return {"sms_and_recording": False, "fire_alarm": False, "response_event": None, "hold_required": True}
         else:
+            # System is NOT armed (or arm window expired).
+            # If an alert is already active/processing, lock out new first-press attempts!
+            with events_lock:
+                if active_event is not None:
+                    return {"sms_and_recording": False, "fire_alarm": False, "response_event": None, "hold_required": False}
+
             if first_time is not None:
-                # Window expired; log that it timed out before they pressed again.
                 category = ALERT_CATEGORIES.get(button_id, "Alert")
                 record_activity(
                     f"[ALARM_WINDOW] {category} 10-second alarm window expired. New alert started.",
                     "pending",
                 )
-            # First press (or window expired): SMS + recording, arm the window.
-            _first_press_times[button_id] = now
 
     # Attempt to create the alert (SMS + recording).
     event = _accept_alert(button_id, duration, source)
     if event is not None:
+        with _first_press_lock:
+            _first_press_times[button_id] = now
         category = ALERT_CATEGORIES.get(button_id, "Alert")
         record_activity(
-            f"[ALARM_ARMED] {category} alert armed. Press the button again within {ALARM_ARM_WINDOW_SECONDS}s to trigger the alarm.",
+            f"[ALARM_ARMED] {category} alert armed. Hold button for 2.5s within {ALARM_ARM_WINDOW_SECONDS}s to trigger the alarm.",
             "pending",
         )
-        # Tell all web clients which button is now armed so they show the correct
-        # visual state even when the first press came from a physical button.
         broadcast({
             "type": "alert_armed",
             "button": button_id,
             "window_seconds": ALARM_ARM_WINDOW_SECONDS,
         })
-    return {"sms_and_recording": True, "fire_alarm": False, "response_event": event}
+    return {"sms_and_recording": True, "fire_alarm": False, "response_event": event, "hold_required": False}
 
 
 
@@ -1108,26 +1191,29 @@ def create_event():
     if button_id not in {"1", "2", "3"}:
         return jsonify(error="button must be 1, 2, or 3"), 400
 
+    is_hold = bool(data.get("hold") or data.get("is_hold") or data.get("action") == "hold")
+
     try:
         duration = max(1, min(300, int(data.get("duration", VIDEO_DURATION_SECONDS))))
     except (TypeError, ValueError):
         duration = VIDEO_DURATION_SECONDS
 
-    result = _handle_button_press(button_id, duration, "hardware_signal")
+    result = _handle_button_press(button_id, duration, "hardware_signal", is_hold=is_hold)
 
     if result["fire_alarm"]:
-        # Second press within the window: trigger the alarm relay.
         _fire_alarm_for_button(button_id)
         return jsonify(message="Alarm triggered.", alarm=True), 202
 
+    if result.get("hold_required"):
+        return jsonify(message="2.5s hold required to trigger alarm.", alarm=False, hold_required=True), 200
+
     event = result["response_event"]
     if event is None:
-        # First press was blocked because another alert is already active.
         logger.warning("Concurrent hardware alert ignored because another alert is active.")
         return jsonify(message="Alert ignored; another alert is already active.", busy=True), 409
 
     return jsonify(
-        message="Alert accepted; SMS and recording started. Press again within 10s to trigger the alarm.",
+        message="Alert accepted; SMS and recording started. Hold button for 2.5s within 10s to trigger the alarm.",
         event_id=event["id"],
         filename=event["filename"],
     ), 202
@@ -1199,17 +1285,21 @@ def trigger_alert():
     if button_id not in {"1", "2", "3"}:
         return jsonify(error="button must be 1, 2, or 3"), 400
 
+    is_hold = bool(data.get("hold") or data.get("is_hold") or data.get("action") == "hold")
+
     try:
         duration = max(1, min(300, int(data.get("duration", VIDEO_DURATION_SECONDS))))
     except (TypeError, ValueError):
         duration = VIDEO_DURATION_SECONDS
 
-    result = _handle_button_press(button_id, duration, "web_trigger")
+    result = _handle_button_press(button_id, duration, "web_trigger", is_hold=is_hold)
 
     if result["fire_alarm"]:
-        # Second click within the 10s window: trigger the alarm relay only.
         _fire_alarm_for_button(button_id)
         return jsonify(message="Alarm triggered.", alarm=True), 202
+
+    if result.get("hold_required"):
+        return jsonify(message="2.5s hold required to trigger alarm.", alarm=False, hold_required=True), 200
 
     event = result["response_event"]
     if event is None:
@@ -1217,7 +1307,7 @@ def trigger_alert():
         return jsonify(error="Another alert is already active.", busy=True), 409
 
     return jsonify(
-        message="Alert accepted; SMS and recording started. Click again within 10s to trigger the alarm.",
+        message="Alert accepted; SMS and recording started. Hold button for 2.5s within 10s to trigger the alarm.",
         event_id=event["id"],
         filename=event["filename"],
     ), 202
