@@ -96,7 +96,7 @@ MAX_RELAY_BEEPS = 50
 # First press  → SMS + recording, no alarm.
 # 2.5s hold within ALARM_ARM_WINDOW_SECONDS → alarm only (no duplicate SMS/recording).
 # Press after the window → treated as a new first press.
-ALARM_ARM_WINDOW_SECONDS = 10
+ALARM_ARM_WINDOW_SECONDS = 20
 ALARM_HOLD_DURATION_SECONDS = 2.5
 _first_press_times = {}   # button_id -> float (time.time() of first press)
 _first_press_lock = threading.Lock()
@@ -673,7 +673,7 @@ function clearLog() {
 // ---- Arm-window state for hold-to-alarm ----
 let _armedButtonId = null;  // null | 1 | 2 | 3
 let _armTimer = null;
-const ARM_WINDOW_MS = 10000;
+const ARM_WINDOW_MS = 30000;
 const HOLD_DURATION_MS = 2500;
 
 let holdTimer = null;
@@ -1117,11 +1117,11 @@ def _handle_button_press(button_id, duration, source, is_hold=False):
     Medical (3): First press always → SMS + recording, no alarm ever.
 
     Security (2) / Hazard (1):
-      * First press   → SMS + recording only, arm a 10-second window.
-      * Second action within the 10-second window:
+      * First press (short click) → SMS + recording only, arm a 30-second window.
+      * Second action within 30-second window:
         - 2.5s hold (is_hold=True) → fire alarm relay.
         - Quick click (is_hold=False) → ignore alarm, require 2.5s hold.
-      * Press after window expires → treated as a new first press (if system is idle).
+      * 2.5s hold (is_hold=True) at any time → fire alarm relay!
     """
     now = time.time()
 
@@ -1147,21 +1147,20 @@ def _handle_button_press(button_id, duration, source, is_hold=False):
                     "pending",
                 )
                 return {"sms_and_recording": False, "fire_alarm": False, "response_event": None, "hold_required": True}
-        else:
-            # System is NOT armed (or arm window expired).
-            # If an alert is already active/processing, lock out new first-press attempts!
-            with events_lock:
-                if active_event is not None:
-                    return {"sms_and_recording": False, "fire_alarm": False, "response_event": None, "hold_required": False}
 
-            if first_time is not None:
-                category = ALERT_CATEGORIES.get(button_id, "Alert")
-                record_activity(
-                    f"[ALARM_WINDOW] {category} 10-second alarm window expired. New alert started.",
-                    "pending",
-                )
+    # If is_hold is True (2.5s hold) even if not currently pre-armed:
+    if is_hold:
+        event = _accept_alert(button_id, duration, source)
+        with _first_press_lock:
+            _first_press_times.pop(button_id, None)
+        return {"sms_and_recording": (event is not None), "fire_alarm": True, "response_event": event, "hold_required": False}
 
-    # Attempt to create the alert (SMS + recording).
+    # System is NOT armed and is_hold is False (short click).
+    with events_lock:
+        if active_event is not None:
+            return {"sms_and_recording": False, "fire_alarm": False, "response_event": None, "hold_required": False}
+
+    # Attempt to create the alert (SMS + recording) for a short click.
     event = _accept_alert(button_id, duration, source)
     if event is not None:
         with _first_press_lock:
