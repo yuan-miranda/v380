@@ -1,0 +1,9 @@
+# Core web framework & WebSocket support (server.py)
+Flask>=3.0.0
+flask-sock>=0.7.0
+
+# HTTP client for worker communication & webhooks (main.py, server.py)
+requests>=2.31.0
+
+# Timezone data for zoneinfo support on Windows (Asia/Manila)
+tzdata>=2024.1
