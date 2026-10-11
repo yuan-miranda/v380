@@ -958,6 +958,11 @@ let holdAnimFrame = null;
 let holdStartTime = 0;
 let isHoldingButton = null;
 let holdTriggered = false;
+let touchStartX = 0;
+let touchStartY = 0;
+let isTouchScrolling = false;
+let lastTouchEndTime = 0;
+const SCROLL_THRESHOLD_PX = 12;
 
 function isArmed() { return _armedButtonId !== null; }
 
@@ -972,7 +977,9 @@ function _resetHoldUI() {
     [1, 2, 3].forEach(id => _updateHoldProgress(id, 0));
     isHoldingButton = null;
     holdTriggered = false;
+    isTouchScrolling = false;
 }
+
 
 function _setArmedButton(buttonId) {
     _armedButtonId = buttonId;
@@ -1043,12 +1050,88 @@ function triggerAlert(buttonId, isHold = false) {
     });
 }
 
-function _onButtonPressStart(buttonId, event) {
-    if (event) {
-        if (event.type === 'touchstart') {
-            event.preventDefault();
+function _onButtonTouchStart(buttonId, event) {
+    const btn = document.getElementById("btn-" + buttonId);
+    if (!btn || btn.disabled) return;
+
+    const touch = event.touches[0];
+    touchStartX = touch.clientX;
+    touchStartY = touch.clientY;
+    isTouchScrolling = false;
+    holdStartTime = Date.now();
+    isHoldingButton = buttonId;
+    holdTriggered = false;
+
+    // Only start 2.5s hold timer if the button is already armed
+    if (_armedButtonId === buttonId) {
+        function animateProgress() {
+            if (isHoldingButton !== buttonId || isTouchScrolling) return;
+            const elapsed = Date.now() - holdStartTime;
+            const pct = (elapsed / HOLD_DURATION_MS) * 100;
+            _updateHoldProgress(buttonId, pct);
+            if (elapsed < HOLD_DURATION_MS) {
+                holdAnimFrame = requestAnimationFrame(animateProgress);
+            }
         }
+        holdAnimFrame = requestAnimationFrame(animateProgress);
+
+        holdTimer = setTimeout(() => {
+            if (isHoldingButton === buttonId && !isTouchScrolling) {
+                holdTriggered = true;
+                _updateHoldProgress(buttonId, 100);
+                triggerAlert(buttonId, true);
+            }
+        }, HOLD_DURATION_MS);
     }
+}
+
+function _onButtonTouchMove(buttonId, event) {
+    if (isHoldingButton !== buttonId) return;
+    const touch = event.touches[0];
+    const dx = touch.clientX - touchStartX;
+    const dy = touch.clientY - touchStartY;
+    if (Math.hypot(dx, dy) > SCROLL_THRESHOLD_PX) {
+        // User is scrolling/swiping! Cancel button action completely.
+        isTouchScrolling = true;
+        _resetHoldUI();
+    }
+}
+
+function _onButtonTouchEnd(buttonId, event) {
+    lastTouchEndTime = Date.now();
+    if (isHoldingButton !== buttonId) {
+        _resetHoldUI();
+        return;
+    }
+
+    if (isTouchScrolling) {
+        _resetHoldUI();
+        return;
+    }
+
+    const elapsed = Date.now() - holdStartTime;
+    const wasArmed = (_armedButtonId === buttonId);
+
+    if (wasArmed) {
+        if (!holdTriggered && elapsed < HOLD_DURATION_MS) {
+            addLog("[ALARM] Hold button for 2.5s to trigger alarm (quick tap ignored).", "pending");
+        }
+    } else {
+        // Clean intentional tap on the button!
+        triggerAlert(buttonId, false);
+    }
+
+    _resetHoldUI();
+}
+
+function _onButtonTouchCancel() {
+    _resetHoldUI();
+}
+
+function _onButtonMouseDown(buttonId, event) {
+    if (event.button !== 0) return;
+    if (Date.now() - lastTouchEndTime < 600) return;
+
     const btn = document.getElementById("btn-" + buttonId);
     if (!btn || btn.disabled) return;
 
@@ -1057,41 +1140,44 @@ function _onButtonPressStart(buttonId, event) {
     holdStartTime = Date.now();
     holdTriggered = false;
 
-    const currentlyArmed = (_armedButtonId === buttonId);
-
-    if (!currentlyArmed && buttonId !== 3) {
-        triggerAlert(buttonId, false);
-    } else if (buttonId === 3) {
-        triggerAlert(buttonId, false);
-        return;
-    }
-
-    function animateProgress() {
-        if (isHoldingButton !== buttonId) return;
-        const elapsed = Date.now() - holdStartTime;
-        const pct = (elapsed / HOLD_DURATION_MS) * 100;
-        _updateHoldProgress(buttonId, pct);
-        if (elapsed < HOLD_DURATION_MS) {
-            holdAnimFrame = requestAnimationFrame(animateProgress);
+    if (_armedButtonId === buttonId) {
+        function animateProgress() {
+            if (isHoldingButton !== buttonId) return;
+            const elapsed = Date.now() - holdStartTime;
+            const pct = (elapsed / HOLD_DURATION_MS) * 100;
+            _updateHoldProgress(buttonId, pct);
+            if (elapsed < HOLD_DURATION_MS) {
+                holdAnimFrame = requestAnimationFrame(animateProgress);
+            }
         }
-    }
-    holdAnimFrame = requestAnimationFrame(animateProgress);
+        holdAnimFrame = requestAnimationFrame(animateProgress);
 
-    holdTimer = setTimeout(() => {
-        holdTriggered = true;
-        _updateHoldProgress(buttonId, 100);
-        triggerAlert(buttonId, true);
-    }, HOLD_DURATION_MS);
+        holdTimer = setTimeout(() => {
+            if (isHoldingButton === buttonId) {
+                holdTriggered = true;
+                _updateHoldProgress(buttonId, 100);
+                triggerAlert(buttonId, true);
+            }
+        }, HOLD_DURATION_MS);
+    }
 }
 
-function _onButtonPressEnd(buttonId, event) {
+function _onButtonMouseUp(buttonId, event) {
+    if (event.button !== 0) return;
+    if (Date.now() - lastTouchEndTime < 600) return;
     if (isHoldingButton !== buttonId) return;
+
     const elapsed = Date.now() - holdStartTime;
     const wasArmed = (_armedButtonId === buttonId);
 
-    if (!holdTriggered && wasArmed && elapsed < HOLD_DURATION_MS) {
-        addLog("[ALARM] Hold button for 2.5s to trigger alarm (double-click ignored).", "pending");
+    if (wasArmed) {
+        if (!holdTriggered && elapsed < HOLD_DURATION_MS) {
+            addLog("[ALARM] Hold button for 2.5s to trigger alarm (quick click ignored).", "pending");
+        }
+    } else {
+        triggerAlert(buttonId, false);
     }
+
     _resetHoldUI();
 }
 
@@ -1099,15 +1185,13 @@ document.addEventListener("DOMContentLoaded", () => {
     [1, 2, 3].forEach(id => {
         const btn = document.getElementById("btn-" + id);
         if (!btn) return;
-        btn.addEventListener("touchstart", (e) => _onButtonPressStart(id, e), {passive: false});
-        btn.addEventListener("touchend", (e) => _onButtonPressEnd(id, e));
-        btn.addEventListener("touchcancel", (e) => _onButtonPressEnd(id, e));
-        btn.addEventListener("mousedown", (e) => {
-            if (e.button !== 0) return;
-            _onButtonPressStart(id, e);
-        });
-        btn.addEventListener("mouseup", (e) => _onButtonPressEnd(id, e));
-        btn.addEventListener("mouseleave", (e) => _onButtonPressEnd(id, e));
+        btn.addEventListener("touchstart", (e) => _onButtonTouchStart(id, e), {passive: true});
+        btn.addEventListener("touchmove", (e) => _onButtonTouchMove(id, e), {passive: true});
+        btn.addEventListener("touchend", (e) => _onButtonTouchEnd(id, e));
+        btn.addEventListener("touchcancel", () => _onButtonTouchCancel());
+        btn.addEventListener("mousedown", (e) => _onButtonMouseDown(id, e));
+        btn.addEventListener("mouseup", (e) => _onButtonMouseUp(id, e));
+        btn.addEventListener("mouseleave", () => _resetHoldUI());
     });
 });
 
