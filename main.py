@@ -9,8 +9,12 @@ from datetime import datetime
 from pathlib import Path
 
 import requests
-import cv2
 import websocket
+
+try:
+    import cv2
+except ImportError:
+    cv2 = None
 
 logging.basicConfig(
     level=logging.INFO,
@@ -335,10 +339,12 @@ def process_event(event):
 
 
 def run_live_stream_service():
-    """Continuously captures CCTV frames and streams them to the server via WebSocket."""
+    """Continuously captures CCTV frames and streams them to the server via WebSocket.
+
+    Uses FFmpeg pipe as primary engine (Termux-friendly, zero compilation, fast hardware decoding).
+    Falls back to OpenCV if FFmpeg is unavailable.
+    """
     logger.info("Live streaming background service started")
-    encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), LIVE_STREAM_QUALITY]
-    frame_interval = 1.0 / max(1, LIVE_STREAM_FPS)
 
     while True:
         current_ip = os.getenv("CCTV_IP", CCTV_IP)
@@ -352,43 +358,36 @@ def run_live_stream_service():
             time.sleep(5)
             continue
 
-        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
-        cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-        if not cap.isOpened():
-            logger.warning(
-                "Live stream: CCTV RTSP not reachable (%s). Retrying in 5s...",
-                rtsp_url,
+        ffmpeg_bin = get_ffmpeg_executable()
+        if not ffmpeg_bin and cv2 is None:
+            logger.error(
+                "Neither FFmpeg nor OpenCV is available. In Termux run 'pkg install ffmpeg', or install imageio-ffmpeg."
             )
             time.sleep(5)
             continue
 
-        logger.info(
-            "Live stream: CCTV RTSP connected (%s). Connecting to server WebSocket: %s",
-            rtsp_url,
-            ws_url,
-        )
         ws = None
+        proc = None
+        cap = None
+
         try:
             ws = websocket.create_connection(ws_url, timeout=10)
             init_payload = {
                 "type": "init",
                 "cctv_ip": current_ip,
                 "fps": LIVE_STREAM_FPS,
-                "width": int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 1280),
-                "height": int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 720),
+                "width": 1280,
+                "height": 720,
                 "timestamp": datetime.now().isoformat(),
             }
             ws.send(json.dumps(init_payload))
-            logger.info("Live stream: Successfully connected to server WebSocket inlet")
+            logger.info("Live stream: Connected to server WebSocket inlet (%s)", ws_url)
         except Exception as ws_err:
             logger.warning(
                 "Live stream: Could not connect to server WebSocket (%s): %s. Retrying in 3s...",
                 ws_url,
                 ws_err,
             )
-            cap.release()
             time.sleep(3)
             continue
 
@@ -397,41 +396,139 @@ def run_live_stream_service():
         active_ip = current_ip
 
         try:
-            while True:
-                # If CCTV_IP was updated by server sync, reconnect to new IP
-                new_ip = os.getenv("CCTV_IP", CCTV_IP)
-                if new_ip != active_ip:
-                    logger.info(
-                        "CCTV_IP updated (%s -> %s). Reconnecting live stream...",
-                        active_ip,
-                        new_ip,
+            if ffmpeg_bin:
+                # Primary Engine: Native FFmpeg piped MJPEG (lightning fast, pure C, Termux prebuilt)
+                cmd = [
+                    ffmpeg_bin,
+                    "-rtsp_transport",
+                    "tcp",
+                    "-i",
+                    rtsp_url,
+                    "-r",
+                    str(LIVE_STREAM_FPS),
+                    "-f",
+                    "image2pipe",
+                    "-vcodec",
+                    "mjpeg",
+                    "-q:v",
+                    "5",
+                    "-",
+                ]
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                )
+                logger.info(
+                    "Live stream: Started FFmpeg RTSP capture pipe (FPS=%d)",
+                    LIVE_STREAM_FPS,
+                )
+
+                buffer = bytearray()
+                while True:
+                    new_ip = os.getenv("CCTV_IP", CCTV_IP)
+                    if new_ip != active_ip:
+                        logger.info(
+                            "CCTV_IP updated (%s -> %s). Reconnecting live stream...",
+                            active_ip,
+                            new_ip,
+                        )
+                        break
+
+                    if proc.poll() is not None:
+                        logger.warning(
+                            "Live stream: FFmpeg process exited (code %s)",
+                            proc.returncode,
+                        )
+                        break
+
+                    chunk = proc.stdout.read(4096)
+                    if not chunk:
+                        break
+                    buffer.extend(chunk)
+
+                    while True:
+                        soi = buffer.find(b"\xff\xd8")
+                        if soi == -1:
+                            buffer.clear()
+                            break
+                        if soi > 0:
+                            del buffer[:soi]
+                        eoi = buffer.find(b"\xff\xd9", 2)
+                        if eoi == -1:
+                            if len(buffer) > 1024 * 1024:
+                                buffer.clear()
+                            break
+                        jpeg_frame = bytes(buffer[:eoi + 2])
+                        del buffer[:eoi + 2]
+
+                        # Skip older frame if a newer complete frame is already in buffer
+                        next_soi = buffer.find(b"\xff\xd8")
+                        next_eoi = (
+                            buffer.find(b"\xff\xd9", next_soi + 2)
+                            if next_soi != -1
+                            else -1
+                        )
+                        if next_soi != -1 and next_eoi != -1:
+                            continue
+
+                        ws.send_binary(jpeg_frame)
+                        frame_counter += 1
+
+                        now = time.time()
+                        if now - last_stat_log >= 15.0:
+                            fps = frame_counter / (now - last_stat_log)
+                            logger.info("Live stream active: %.1f FPS to server", fps)
+                            frame_counter = 0
+                            last_stat_log = now
+
+            elif cv2 is not None:
+                # Fallback Engine: OpenCV VideoCapture
+                logger.info("Live stream: Falling back to OpenCV capture engine")
+                encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), LIVE_STREAM_QUALITY]
+                frame_interval = 1.0 / max(1, LIVE_STREAM_FPS)
+
+                os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+                cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+                if not cap.isOpened():
+                    logger.warning(
+                        "Live stream: CCTV RTSP not reachable via OpenCV (%s)",
+                        rtsp_url,
                     )
-                    break
-
-                tick_start = time.time()
-                ret, frame = cap.read()
-                if not ret or frame is None:
-                    time.sleep(0.02)
+                    time.sleep(3)
                     continue
 
-                ret, jpeg_buf = cv2.imencode(".jpg", frame, encode_params)
-                if not ret:
-                    continue
+                while True:
+                    new_ip = os.getenv("CCTV_IP", CCTV_IP)
+                    if new_ip != active_ip:
+                        break
 
-                ws.send_binary(jpeg_buf.tobytes())
-                frame_counter += 1
+                    tick_start = time.time()
+                    ret, frame = cap.read()
+                    if not ret or frame is None:
+                        time.sleep(0.02)
+                        continue
 
-                now = time.time()
-                if now - last_stat_log >= 15.0:
-                    fps = frame_counter / (now - last_stat_log)
-                    logger.info("Live stream active: %.1f FPS to server", fps)
-                    frame_counter = 0
-                    last_stat_log = now
+                    ret, jpeg_buf = cv2.imencode(".jpg", frame, encode_params)
+                    if not ret:
+                        continue
 
-                elapsed = time.time() - tick_start
-                sleep_time = frame_interval - elapsed
-                if sleep_time > 0.001:
-                    time.sleep(sleep_time)
+                    ws.send_binary(jpeg_buf.tobytes())
+                    frame_counter += 1
+
+                    now = time.time()
+                    if now - last_stat_log >= 15.0:
+                        fps = frame_counter / (now - last_stat_log)
+                        logger.info("Live stream active: %.1f FPS to server", fps)
+                        frame_counter = 0
+                        last_stat_log = now
+
+                    elapsed = time.time() - tick_start
+                    sleep_time = frame_interval - elapsed
+                    if sleep_time > 0.001:
+                        time.sleep(sleep_time)
 
         except Exception as stream_err:
             logger.warning(
@@ -439,14 +536,20 @@ def run_live_stream_service():
                 stream_err,
             )
         finally:
-            if ws:
+            if proc:
                 try:
-                    ws.close()
+                    proc.terminate()
+                    proc.wait(timeout=2)
                 except Exception:
                     pass
             if cap:
                 try:
                     cap.release()
+                except Exception:
+                    pass
+            if ws:
+                try:
+                    ws.close()
                 except Exception:
                     pass
             time.sleep(3)
