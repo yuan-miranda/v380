@@ -120,6 +120,7 @@ RTSP_PASS = os.getenv("RTSP_PASS", "password")
 ENABLE_LIVE_STREAM = os.getenv("ENABLE_LIVE_STREAM", "true").lower() in {"1", "true", "yes", "on"}
 LIVE_STREAM_FPS = int(os.getenv("LIVE_STREAM_FPS", "15"))
 LIVE_STREAM_QUALITY = int(os.getenv("LIVE_STREAM_QUALITY", "75"))
+live_stream_pause_event = threading.Event()
 
 
 def get_ffmpeg_executable():
@@ -205,14 +206,8 @@ def record_cctv_stream(filename, duration_seconds, cctv_ip=None):
         logger.error("Recording skipped: RTSP URL or FFmpeg is unavailable")
         return False
 
-    logger.info(
-        "Recording started: duration=%ss output=%s url=%s",
-        duration_seconds,
-        filename,
-        rtsp_url,
-    )
-    try:
-        result = subprocess.run(
+    def _run_recording_proc():
+        return subprocess.run(
             [
                 ffmpeg_bin,
                 "-y",
@@ -236,12 +231,41 @@ def record_cctv_stream(filename, duration_seconds, cctv_ip=None):
             check=False,
             text=True,
         )
+
+    logger.info(
+        "Recording started: duration=%ss output=%s url=%s",
+        duration_seconds,
+        filename,
+        rtsp_url,
+    )
+    result = None
+    try:
+        result = _run_recording_proc()
     except (OSError, subprocess.TimeoutExpired) as error:
-        logger.error("Recording failed: %s", error)
-        return False
+        logger.error("Recording initial run exception: %s", error)
+
+    # If camera only permits 1 RTSP connection, temporarily yield the live stream and retry
+    if not (
+        result
+        and result.returncode == 0
+        and os.path.isfile(filename)
+        and os.path.getsize(filename) > 0
+    ):
+        logger.warning(
+            "Initial recording failed or camera busy; pausing live stream to guarantee camera access..."
+        )
+        live_stream_pause_event.set()
+        time.sleep(1.5)
+        try:
+            result = _run_recording_proc()
+        except Exception as retry_err:
+            logger.error("Recording retry failed: %s", retry_err)
+        finally:
+            live_stream_pause_event.clear()
 
     if (
-        result.returncode == 0
+        result
+        and result.returncode == 0
         and os.path.isfile(filename)
         and os.path.getsize(filename) > 0
     ):
@@ -252,10 +276,12 @@ def record_cctv_stream(filename, duration_seconds, cctv_ip=None):
         )
         return True
 
-    logger.error("FFmpeg recording failed: %s", result.stderr[-500:].strip())
+    if result and result.stderr:
+        logger.error("FFmpeg recording failed: %s", result.stderr[-500:].strip())
     if os.path.exists(filename):
         os.remove(filename)
     return False
+
 
 
 def upload_video(filename):
@@ -347,6 +373,10 @@ def run_live_stream_service():
     logger.info("Live streaming background service started")
 
     while True:
+        if live_stream_pause_event.is_set():
+            time.sleep(1.0)
+            continue
+
         current_ip = os.getenv("CCTV_IP", CCTV_IP)
         server_endpoint = os.getenv("VPS_ENDPOINT", VPS_ENDPOINT)
         ws_url = resolve_server_ws_url(server_endpoint)
@@ -426,6 +456,10 @@ def run_live_stream_service():
 
                 buffer = bytearray()
                 while True:
+                    if live_stream_pause_event.is_set():
+                        logger.info("Live stream pausing for emergency alert recording...")
+                        break
+
                     new_ip = os.getenv("CCTV_IP", CCTV_IP)
                     if new_ip != active_ip:
                         logger.info(
