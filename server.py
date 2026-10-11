@@ -789,7 +789,7 @@ WEB_PAGE = """
     <div class="container">
         <h2>{{ product_name }}</h2><p class="subtitle">Emergency Reporting System</p>
         <div class="button-stack"><button class="btn-hazard" id="btn-1" type="button"><span class="btn-label">Hazard</span><span class="armed-badge" id="badge-1"></span><div class="hold-progress" id="progress-1"></div></button><button class="btn-security" id="btn-2" type="button"><span class="btn-label">Security</span><span class="armed-badge" id="badge-2"></span><div class="hold-progress" id="progress-2"></div></button><button class="btn-medical" id="btn-3" type="button"><span class="btn-label">Medical Concern</span><span class="armed-badge" id="badge-3"></span><div class="hold-progress" id="progress-3"></div></button><button class="btn-disarm" type="button" onclick="disarmAlarm()">Disarm Alarm</button></div>
-        <section class="activity-log"><div class="log-header"><span>Activity log</span><div class="log-actions"><a class="log-action" href="/live" target="_blank" style="text-decoration:none;display:inline-flex;align-items:center;background:#0284c7;color:#ffffff;border-radius:2px;">Live Feed</a><button class="log-action" id="log-state" type="button" disabled>Ready</button><button class="log-action" type="button" onclick="clearLog()">Clear log</button><button class="log-action" type="button" onclick="document.getElementById('configuration').classList.toggle('open')">Configuration</button></div></div><div id="status"><div class="log-empty">No alerts recorded in this session.</div></div></section>
+        <section class="activity-log"><div class="log-header"><span>Activity log</span><div class="log-actions"><button class="log-action" id="log-state" type="button" disabled>Ready</button><button class="log-action" type="button" onclick="clearLog()">Clear log</button><button class="log-action" type="button" onclick="document.getElementById('configuration').classList.toggle('open')">Configuration</button></div></div><div id="status"><div class="log-empty">No alerts recorded in this session.</div></div></section>
         <form class="configuration" id="configuration" onsubmit="saveConfiguration(event)">
             <label for="cctv_ip">CCTV IP Address</label>
             <input id="cctv_ip" type="text" value="{{ cctv_ip }}" required>
@@ -1933,684 +1933,467 @@ LIVE_PAGE_HTML = """
 <html lang="en">
 <head>
     <meta charset="utf-8">
-    <title>{{ product_name }} Live CCTV Surveillance</title>
+    <title>Live CCTV Feed</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="theme-color" content="#090d16">
-    <link rel="icon" type="image/png" href="/icon-192.png">
+    <meta name="theme-color" content="#000000">
     <style>
-        :root {
-            --bg-base: #070a13;
-            --bg-card: rgba(15, 23, 42, 0.85);
-            --border-color: rgba(255, 255, 255, 0.08);
-            --text-main: #f8fafc;
-            --text-muted: #94a3b8;
-            --accent-green: #10b981;
-            --accent-red: #ef4444;
-            --accent-blue: #0284c7;
-        }
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Inter", Helvetica, Arial, sans-serif;
-            background: var(--bg-base);
-            color: var(--text-main);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background: #000000;
+            color: #ffffff;
             min-height: 100vh;
             display: flex;
             flex-direction: column;
-            overflow-x: hidden;
         }
-        .header {
+
+        /* Top Header */
+        header {
             display: flex;
             align-items: center;
             justify-content: space-between;
-            padding: 16px 24px;
-            background: rgba(11, 16, 30, 0.95);
-            border-bottom: 1px solid var(--border-color);
-            position: sticky;
-            top: 0;
-            z-index: 50;
-            backdrop-filter: blur(10px);
-        }
-        .header-brand {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-        }
-        .brand-badge {
-            background: linear-gradient(135deg, #b91c1c, #dc2626);
-            color: white;
-            font-size: 11px;
-            font-weight: 800;
-            padding: 4px 8px;
-            letter-spacing: 0.1em;
-            text-transform: uppercase;
-            border-radius: 4px;
-        }
-        .brand-title {
-            font-size: 18px;
-            font-weight: 700;
-            letter-spacing: -0.02em;
-            color: #ffffff;
-        }
-        .header-status-group {
-            display: flex;
-            align-items: center;
-            gap: 10px;
+            padding: 12px 20px;
+            background: #0a0a0a;
+            border-bottom: 1px solid #222222;
             flex-wrap: wrap;
+            gap: 10px;
         }
-        .status-pill {
-            display: inline-flex;
-            align-items: center;
-            gap: 6px;
-            padding: 5px 12px;
-            border-radius: 20px;
-            font-size: 12px;
-            font-weight: 600;
-            letter-spacing: 0.03em;
-            background: rgba(255, 255, 255, 0.05);
-            border: 1px solid var(--border-color);
-        }
-        .status-pill.online {
-            background: rgba(16, 185, 129, 0.12);
-            color: #34d399;
-            border-color: rgba(16, 185, 129, 0.3);
-        }
-        .status-pill.offline {
-            background: rgba(239, 68, 68, 0.12);
-            color: #f87171;
-            border-color: rgba(239, 68, 68, 0.3);
-        }
-        .status-pill.rec {
-            background: rgba(220, 38, 38, 0.15);
-            color: #fca5a5;
-            border-color: rgba(220, 38, 38, 0.4);
-        }
-        .dot {
-            width: 8px;
-            height: 8px;
-            border-radius: 50%;
-            background: currentColor;
-        }
-        .pulse {
-            animation: pulseAnim 1.6s infinite ease-in-out;
-        }
-        @keyframes pulseAnim {
-            0% { transform: scale(0.9); opacity: 0.7; }
-            50% { transform: scale(1.3); opacity: 1; }
-            100% { transform: scale(0.9); opacity: 0.7; }
-        }
-        .header-nav {
+        .header-title {
+            font-size: 15px;
+            font-weight: 700;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
             display: flex;
             align-items: center;
             gap: 10px;
         }
-        .nav-btn {
-            background: rgba(255, 255, 255, 0.06);
-            color: var(--text-main);
-            text-decoration: none;
-            padding: 7px 14px;
-            border-radius: 6px;
+        .header-meta {
+            color: #888888;
             font-size: 13px;
-            font-weight: 600;
-            border: 1px solid var(--border-color);
-            transition: all 0.15s ease;
-            display: inline-flex;
-            align-items: center;
-            gap: 6px;
+            font-family: ui-monospace, SFMono-Regular, monospace;
         }
-        .nav-btn:hover {
-            background: rgba(255, 255, 255, 0.12);
-            border-color: rgba(255, 255, 255, 0.2);
-        }
-
-        .main-container {
-            max-width: 1360px;
-            width: 100%;
-            margin: 0 auto;
-            padding: 24px;
-            display: flex;
-            flex-direction: column;
-            gap: 24px;
-        }
-
-        .viewport-card {
-            background: var(--bg-card);
-            border: 1px solid var(--border-color);
-            border-radius: 12px;
-            overflow: hidden;
-            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
-            display: flex;
-            flex-direction: column;
-        }
-        .viewport-header {
-            padding: 12px 18px;
-            background: rgba(15, 23, 42, 0.95);
-            border-bottom: 1px solid var(--border-color);
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            font-size: 13px;
-            font-weight: 600;
-            color: var(--text-muted);
-        }
-        .camera-info {
+        .header-status {
             display: flex;
             align-items: center;
             gap: 8px;
-            color: #f1f5f9;
-        }
-        .ip-pill {
+            font-size: 12px;
             font-family: ui-monospace, SFMono-Regular, monospace;
-            background: rgba(2, 132, 199, 0.15);
-            color: #38bdf8;
-            padding: 2px 7px;
-            border-radius: 4px;
-            font-size: 11px;
-            letter-spacing: 0.05em;
+        }
+        .badge {
+            padding: 3px 8px;
+            border: 1px solid #333333;
+            background: #111111;
+            color: #ffffff;
+            border-radius: 3px;
+        }
+        .badge-live {
+            background: #ffffff;
+            color: #000000;
+            font-weight: 700;
+            border-color: #ffffff;
         }
 
-        .video-wrapper {
+        /* Main Grid Layout */
+        .container {
+            display: grid;
+            grid-template-columns: 1fr 340px;
+            gap: 16px;
+            max-width: 1400px;
+            width: 100%;
+            margin: 0 auto;
+            padding: 16px;
+            flex: 1;
+        }
+        @media (max-width: 960px) {
+            .container {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        /* Video Section */
+        .video-section {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        .video-box {
             position: relative;
             width: 100%;
             aspect-ratio: 16 / 9;
-            background: #030712;
+            background: #050505;
+            border: 1px solid #222222;
+            overflow: hidden;
             display: flex;
             align-items: center;
             justify-content: center;
-            overflow: hidden;
         }
         #liveVideo {
             width: 100%;
             height: 100%;
             object-fit: contain;
             display: block;
-            background: #000;
+            background: #000000;
         }
-
-        .hud-overlay {
+        .offline-placeholder {
             position: absolute;
             inset: 0;
-            pointer-events: none;
-            display: flex;
-            flex-direction: column;
-            justify-content: space-between;
-            padding: 16px;
-            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-            text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9), 0 0 8px rgba(0,0,0,0.8);
-        }
-        .hud-top {
-            display: flex;
-            justify-content: space-between;
-            align-items: flex-start;
-        }
-        .hud-bottom {
-            display: flex;
-            justify-content: space-between;
-            align-items: flex-end;
-        }
-        .hud-tag {
-            background: rgba(0, 0, 0, 0.65);
-            backdrop-filter: blur(4px);
-            padding: 4px 8px;
-            border-radius: 4px;
-            font-size: 12px;
-            color: #f8fafc;
-            border: 1px solid rgba(255, 255, 255, 0.1);
-        }
-
-        .standby-overlay {
-            position: absolute;
-            inset: 0;
-            background: rgba(7, 10, 19, 0.92);
             display: flex;
             flex-direction: column;
             align-items: center;
             justify-content: center;
-            gap: 16px;
+            background: #000000;
+            color: #888888;
+            font-size: 14px;
+            gap: 6px;
             text-align: center;
-            padding: 24px;
-            z-index: 10;
-            transition: opacity 0.3s ease;
+            padding: 16px;
         }
-        .standby-overlay.hidden {
+        .offline-placeholder.hidden {
             display: none;
         }
-        .radar-box {
-            position: relative;
-            width: 80px;
-            height: 80px;
-            border: 2px solid rgba(2, 132, 199, 0.3);
-            border-radius: 50%;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-        }
-        .radar-box::after {
-            content: "";
-            position: absolute;
-            inset: 6px;
-            border: 2px dashed rgba(2, 132, 199, 0.6);
-            border-radius: 50%;
-            animation: radarRotate 4s linear infinite;
-        }
-        @keyframes radarRotate {
-            to { transform: rotate(360deg); }
-        }
-        .radar-dot {
-            width: 12px;
-            height: 12px;
-            border-radius: 50%;
-            background: #0284c7;
-            box-shadow: 0 0 15px #38bdf8;
-            animation: pulseAnim 1.4s infinite ease-in-out;
-        }
-        .standby-title {
-            font-size: 18px;
-            font-weight: 700;
-            color: #f8fafc;
-        }
-        .standby-desc {
-            font-size: 13px;
-            color: var(--text-muted);
-            max-width: 480px;
-            line-height: 1.5;
-        }
-        .code-snippet {
-            background: rgba(15, 23, 42, 0.9);
-            border: 1px solid rgba(255, 255, 255, 0.12);
-            padding: 8px 14px;
-            border-radius: 6px;
+        .offline-placeholder code {
             font-family: ui-monospace, SFMono-Regular, monospace;
             font-size: 12px;
-            color: #38bdf8;
-            user-select: all;
+            background: #111111;
+            border: 1px solid #222222;
+            padding: 4px 8px;
+            color: #ffffff;
+            margin-top: 6px;
         }
 
-        .controls-bar {
-            padding: 12px 18px;
-            background: rgba(15, 23, 42, 0.95);
-            border-top: 1px solid var(--border-color);
+        /* Controls Row */
+        .controls-row {
             display: flex;
+            align-items: center;
             justify-content: space-between;
-            align-items: center;
             flex-wrap: wrap;
-            gap: 12px;
+            gap: 8px;
         }
-        .controls-left, .controls-right {
+        .btn-group {
             display: flex;
-            align-items: center;
-            gap: 10px;
+            gap: 8px;
+            flex-wrap: wrap;
         }
-        .ctrl-btn {
-            background: rgba(255, 255, 255, 0.06);
-            color: #f8fafc;
-            border: 1px solid var(--border-color);
-            padding: 8px 14px;
-            border-radius: 6px;
-            font-size: 13px;
+        button, .btn-link {
+            background: #111111;
+            color: #ffffff;
+            border: 1px solid #333333;
+            padding: 6px 12px;
+            font-size: 12px;
             font-weight: 600;
             cursor: pointer;
+            border-radius: 3px;
+            text-decoration: none;
             display: inline-flex;
             align-items: center;
-            gap: 6px;
-            transition: all 0.15s ease;
             user-select: none;
-            text-decoration: none;
+            font-family: inherit;
         }
-        .ctrl-btn:hover {
-            background: rgba(255, 255, 255, 0.12);
-            border-color: rgba(255, 255, 255, 0.2);
+        button:hover, .btn-link:hover {
+            background: #222222;
+            border-color: #555555;
         }
-        .ctrl-btn:active {
-            transform: scale(0.97);
+        button.btn-primary {
+            background: #ffffff;
+            color: #000000;
+            border-color: #ffffff;
+        }
+        button.btn-primary:hover {
+            background: #e5e5e5;
         }
 
-        .recordings-card {
-            background: var(--bg-card);
-            border: 1px solid var(--border-color);
-            border-radius: 12px;
-            padding: 20px 24px;
-            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+        /* Sidebar Panels */
+        .sidebar {
             display: flex;
             flex-direction: column;
             gap: 16px;
         }
-        .recordings-header {
+        .panel {
+            background: #0a0a0a;
+            border: 1px solid #222222;
+            border-radius: 3px;
+            padding: 14px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        .panel-title {
+            font-size: 12px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: #888888;
+            border-bottom: 1px solid #1a1a1a;
+            padding-bottom: 8px;
             display: flex;
             justify-content: space-between;
             align-items: center;
-            flex-wrap: wrap;
-            gap: 10px;
-            padding-bottom: 12px;
-            border-bottom: 1px solid var(--border-color);
         }
-        .recordings-title {
-            font-size: 16px;
-            font-weight: 700;
-            color: #f8fafc;
-            display: flex;
-            align-items: center;
+
+        /* Key-Value Info Grid */
+        .info-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
             gap: 8px;
+            font-size: 12px;
+            font-family: ui-monospace, SFMono-Regular, monospace;
         }
-        .table-responsive {
-            width: 100%;
-            overflow-x: auto;
+        .info-cell {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+            background: #111111;
+            padding: 8px;
+            border: 1px solid #1a1a1a;
+            border-radius: 2px;
+        }
+        .info-label {
+            font-size: 10px;
+            color: #666666;
+            text-transform: uppercase;
+        }
+        .info-val {
+            color: #ffffff;
+            font-weight: 600;
+            word-break: break-all;
+        }
+
+        /* Recordings Table */
+        .recordings-box {
+            max-height: 380px;
+            overflow-y: auto;
         }
         table {
             width: 100%;
             border-collapse: collapse;
-            font-size: 13px;
+            font-size: 12px;
             text-align: left;
         }
         th {
-            padding: 10px 14px;
-            color: var(--text-muted);
+            padding: 6px 8px;
+            color: #666666;
             font-weight: 600;
-            border-bottom: 1px solid var(--border-color);
+            border-bottom: 1px solid #222222;
+            font-size: 10px;
             text-transform: uppercase;
-            font-size: 11px;
-            letter-spacing: 0.05em;
         }
         td {
-            padding: 12px 14px;
-            border-bottom: 1px solid rgba(255, 255, 255, 0.04);
-            color: #e2e8f0;
+            padding: 8px;
+            border-bottom: 1px solid #141414;
+            color: #cccccc;
+            font-family: ui-monospace, SFMono-Regular, monospace;
+            font-size: 11px;
         }
         tr:hover td {
-            background: rgba(255, 255, 255, 0.03);
+            background: #111111;
         }
-        .rec-filename {
-            font-family: ui-monospace, SFMono-Regular, monospace;
-            font-weight: 600;
-            color: #38bdf8;
-        }
-        .rec-actions {
+        .actions-cell {
             display: flex;
-            gap: 8px;
-        }
-        .rec-btn {
-            padding: 5px 10px;
-            border-radius: 4px;
-            font-size: 12px;
-            font-weight: 600;
-            text-decoration: none;
-            border: 1px solid var(--border-color);
-            background: rgba(255, 255, 255, 0.05);
-            color: #f1f5f9;
-            cursor: pointer;
-            display: inline-flex;
-            align-items: center;
             gap: 4px;
-            transition: all 0.15s ease;
         }
-        .rec-btn:hover {
-            background: rgba(255, 255, 255, 0.12);
-        }
-        .rec-btn-watch {
-            background: rgba(2, 132, 199, 0.2);
-            color: #7dd3fc;
-            border-color: rgba(2, 132, 199, 0.4);
+        .small-btn {
+            padding: 3px 6px;
+            font-size: 10px;
         }
 
-        .modal-backdrop {
+        /* Modal Player */
+        .modal {
             display: none;
             position: fixed;
             inset: 0;
-            background: rgba(0, 0, 0, 0.85);
-            backdrop-filter: blur(8px);
+            background: rgba(0, 0, 0, 0.9);
             z-index: 100;
             align-items: center;
             justify-content: center;
-            padding: 24px;
+            padding: 16px;
         }
-        .modal-backdrop.open {
+        .modal.open {
             display: flex;
         }
-        .modal-box {
-            background: #0f172a;
-            border: 1px solid var(--border-color);
-            border-radius: 12px;
+        .modal-content {
+            background: #0a0a0a;
+            border: 1px solid #333333;
             width: 100%;
-            max-width: 900px;
-            overflow: hidden;
+            max-width: 800px;
             display: flex;
             flex-direction: column;
-            box-shadow: 0 20px 50px rgba(0,0,0,0.8);
         }
         .modal-header {
-            padding: 14px 18px;
-            background: #1e293b;
+            padding: 10px 14px;
+            background: #111111;
+            border-bottom: 1px solid #222222;
             display: flex;
             justify-content: space-between;
             align-items: center;
-        }
-        .modal-title {
-            font-size: 14px;
-            font-weight: 700;
-            color: #f8fafc;
+            font-size: 13px;
             font-family: ui-monospace, SFMono-Regular, monospace;
         }
         .modal-close {
             background: none;
             border: none;
-            color: #94a3b8;
-            font-size: 20px;
-            font-weight: bold;
+            color: #ffffff;
+            font-size: 18px;
             cursor: pointer;
+            padding: 0 4px;
         }
-        .modal-video-wrap {
+        .modal-body video {
             width: 100%;
             aspect-ratio: 16 / 9;
-            background: #000;
-        }
-        .modal-video-wrap video {
-            width: 100%;
-            height: 100%;
             display: block;
-        }
-
-        @media (max-width: 768px) {
-            .header { padding: 12px 16px; flex-direction: column; align-items: flex-start; gap: 10px; }
-            .header-status-group { width: 100%; justify-content: space-between; }
-            .main-container { padding: 16px; gap: 16px; }
-            .controls-bar { flex-direction: column; align-items: stretch; }
-            .controls-left, .controls-right { justify-content: space-around; width: 100%; }
+            background: #000000;
         }
     </style>
 </head>
 <body>
-    <header class="header">
-        <div class="header-brand">
-            <span class="brand-badge">{{ product_name }}</span>
-            <span class="brand-title">Live CCTV Surveillance</span>
+    <header>
+        <div class="header-title">
+            <span>LIVE CCTV MONITOR</span>
+            <span class="header-meta">CCTV: {{ cctv_ip }}</span>
         </div>
-        <div class="header-status-group">
-            <div class="status-pill offline" id="streamStatusPill">
-                <span class="dot" id="streamStatusDot"></span>
-                <span id="streamStatusText">CONNECTING...</span>
-            </div>
-            <div class="status-pill rec" id="recStatusPill">
-                <span class="dot pulse"></span>
-                <span id="recStatusText">REC ON SERVER</span>
-            </div>
-            <div class="status-pill" id="fpsPill">
-                <span id="fpsCounter">0.0 FPS</span>
-            </div>
-        </div>
-        <div class="header-nav">
-            <a class="nav-btn" href="/">Dashboard</a>
-            <a class="nav-btn" href="/videos">Incident Videos</a>
+        <div class="header-status">
+            <span class="badge" id="streamBadge">[OFFLINE]</span>
+            <span class="badge" id="recBadge">[REC: ACTIVE]</span>
+            <span class="badge" id="fpsBadge">0.0 FPS</span>
         </div>
     </header>
 
-    <main class="main-container">
-        <section class="viewport-card" id="viewportCard">
-            <div class="viewport-header">
-                <div class="camera-info">
-                    <strong>Channel 01</strong>
-                    <span>•</span>
-                    <span class="ip-pill">CCTV IP: <span id="cctvIpDisplay">{{ cctv_ip }}</span></span>
-                </div>
-                <div id="clockDisplay">--:--:-- --</div>
-            </div>
-
-            <div class="video-wrapper" id="videoWrapper">
-                <img id="liveVideo" alt="Live Stream" />
+    <div class="container">
+        <!-- Left: Live Video Display & Controls -->
+        <div class="video-section">
+            <div class="video-box" id="videoBox">
+                <img id="liveVideo" alt="CCTV Feed" />
                 <canvas id="snapshotCanvas" style="display:none;"></canvas>
 
-                <div class="hud-overlay">
-                    <div class="hud-top">
-                        <div class="hud-tag">CAM-01 • LIVE RTSP FEED</div>
-                        <div class="hud-tag" id="hudClock">--:--:--</div>
-                    </div>
-                    <div class="hud-bottom">
-                        <div class="hud-tag">
-                            <span>FPS: <strong id="hudFps">0.0</strong></span> | 
-                            <span>FRAMES: <strong id="hudFrames">0</strong></span>
-                        </div>
-                        <div class="hud-tag" id="hudRec">REC: ACTIVE</div>
-                    </div>
-                </div>
-
-                <div class="standby-overlay" id="standbyOverlay">
-                    <div class="radar-box">
-                        <div class="radar-dot"></div>
-                    </div>
-                    <div class="standby-title">Live Video Feed Offline</div>
-                    <p class="standby-desc">
-                        The ALERTO server is ready and listening for WebSocket streaming on <code>/ws/live-feed</code>.
-                        Ensure <code>main.py</code> is running on the local CCTV network.
-                    </p>
-                    <div class="code-snippet">python main.py</div>
-
+                <div class="offline-placeholder" id="offlineNotice">
+                    <div>No Camera Stream Detected</div>
+                    <div style="font-size:12px; color:#555555;">Start the worker on your laptop to begin streaming</div>
+                    <code>python main.py</code>
                 </div>
             </div>
 
-            <div class="controls-bar">
-                <div class="controls-left">
-                    <button class="ctrl-btn" onclick="captureSnapshot()" title="Capture High-Res Snapshot">
-                        📸 Snapshot
-                    </button>
-                    <button class="ctrl-btn" id="pauseBtn" onclick="togglePause()" title="Pause live rendering">
-                        ⏸ Pause
-                    </button>
-                    <button class="ctrl-btn" onclick="forceReconnect()" title="Reconnect WebSocket">
-                        🔄 Reconnect
-                    </button>
+            <div class="controls-row">
+                <div class="btn-group">
+                    <button class="btn-primary" onclick="captureSnapshot()">Save Snapshot</button>
+                    <button id="pauseBtn" onclick="togglePause()">Pause</button>
+                    <button onclick="forceReconnect()">Reconnect</button>
                 </div>
-                <div class="controls-right">
-                    <a class="ctrl-btn" href="/live/feed.mjpg" target="_blank" title="Direct MJPEG Stream">
-                        🔗 MJPEG Feed
-                    </a>
-                    <button class="ctrl-btn" onclick="toggleFullscreen()" title="Toggle Fullscreen">
-                        ⛶ Fullscreen
-                    </button>
+                <div class="btn-group">
+                    <a class="btn-link" href="/live/feed.mjpg" target="_blank">MJPEG Stream</a>
+                    <button onclick="toggleFullscreen()">Fullscreen</button>
                 </div>
             </div>
-        </section>
+        </div>
 
-        <section class="recordings-card">
-            <div class="recordings-header">
-                <div>
-                    <div class="recordings-title">
-                        <span>🔴 Continuous Server Recordings</span>
+        <!-- Right: Status Grid & Server Recordings List -->
+        <div class="sidebar">
+            <!-- Status Panel -->
+            <div class="panel">
+                <div class="panel-title">Stream Status</div>
+                <div class="info-grid">
+                    <div class="info-cell">
+                        <span class="info-label">Status</span>
+                        <span class="info-val" id="statusVal">Offline</span>
                     </div>
-                    <p style="font-size:12px; color:var(--text-muted); margin-top:4px;">
-                        The incoming live CCTV feed is continuously recorded and saved to server storage in rolling segments.
-                    </p>
+                    <div class="info-cell">
+                        <span class="info-label">Frame Rate</span>
+                        <span class="info-val" id="fpsVal">0.0 FPS</span>
+                    </div>
+                    <div class="info-cell">
+                        <span class="info-label">Recording</span>
+                        <span class="info-val" id="recVal">Active</span>
+                    </div>
+                    <div class="info-cell">
+                        <span class="info-label">Frames</span>
+                        <span class="info-val" id="framesVal">0</span>
+                    </div>
+                    <div class="info-cell" style="grid-column: span 2;">
+                        <span class="info-label">Active Recording File</span>
+                        <span class="info-val" id="fileVal" style="font-size: 11px;">--</span>
+                    </div>
                 </div>
-                <button class="ctrl-btn" onclick="fetchRecordings()" title="Refresh list">
-                    ↻ Refresh List
-                </button>
             </div>
 
-            <div class="table-responsive">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>File Name</th>
-                            <th>Timestamp</th>
-                            <th>Size</th>
-                            <th>Actions</th>
-                        </tr>
-                    </thead>
-                    <tbody id="recordingsTableBody">
-                        <tr>
-                            <td colspan="4" style="text-align:center; color:var(--text-muted); padding:24px;">
-                                Loading recorded video segments...
-                            </td>
-                        </tr>
-                    </tbody>
-                </table>
+            <!-- Recordings Panel -->
+            <div class="panel">
+                <div class="panel-title">
+                    <span>Server Recordings</span>
+                    <button class="small-btn" onclick="fetchRecordings()">Refresh</button>
+                </div>
+                <div class="recordings-box">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>File</th>
+                                <th>Size</th>
+                                <th>Action</th>
+                            </tr>
+                        </thead>
+                        <tbody id="recordingsTbody">
+                            <tr>
+                                <td colspan="3" style="text-align:center; color:#555555; padding:16px;">
+                                    Loading recordings...
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
             </div>
-        </section>
-    </main>
+        </div>
+    </div>
 
-    <div class="modal-backdrop" id="videoModal">
-        <div class="modal-box">
+    <!-- Video Modal Player -->
+    <div class="modal" id="videoModal">
+        <div class="modal-content">
             <div class="modal-header">
-                <span class="modal-title" id="modalVideoTitle">Watch Recording</span>
+                <span id="modalFilename">Recording Preview</span>
                 <button class="modal-close" onclick="closeModal()">&times;</button>
             </div>
-            <div class="modal-video-wrap">
-                <video id="modalVideoPlayer" controls autoplay></video>
+            <div class="modal-body">
+                <video id="modalPlayer" controls autoplay></video>
             </div>
         </div>
     </div>
 
     <script>
         const liveImg = document.getElementById("liveVideo");
-        const standbyOverlay = document.getElementById("standbyOverlay");
-        const streamStatusPill = document.getElementById("streamStatusPill");
-        const streamStatusDot = document.getElementById("streamStatusDot");
-        const streamStatusText = document.getElementById("streamStatusText");
-        const fpsCounter = document.getElementById("fpsCounter");
-        const hudFps = document.getElementById("hudFps");
-        const hudFrames = document.getElementById("hudFrames");
-        const hudClock = document.getElementById("hudClock");
-        const hudRec = document.getElementById("hudRec");
-        const clockDisplay = document.getElementById("clockDisplay");
-        const cctvIpDisplay = document.getElementById("cctvIpDisplay");
+        const offlineNotice = document.getElementById("offlineNotice");
+        const streamBadge = document.getElementById("streamBadge");
+        const recBadge = document.getElementById("recBadge");
+        const fpsBadge = document.getElementById("fpsBadge");
+        const statusVal = document.getElementById("statusVal");
+        const fpsVal = document.getElementById("fpsVal");
+        const recVal = document.getElementById("recVal");
+        const framesVal = document.getElementById("framesVal");
+        const fileVal = document.getElementById("fileVal");
         const pauseBtn = document.getElementById("pauseBtn");
 
         let ws = null;
         let activeBlobUrl = null;
         let isPaused = false;
         let frameCount = 0;
-        let totalFramesReceived = 0;
-        let fpsTimer = null;
+        let totalFrames = 0;
         let reconnectDelay = 1000;
-        let hasReceivedFirstFrame = false;
+        let receivedFirstFrame = false;
 
-        function updateClock() {
-            const now = new Date();
-            const timeStr = now.toLocaleTimeString("en-US", { hour12: true });
-            const dateStr = now.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
-            const fullClock = `${dateStr} — ${timeStr}`;
-            clockDisplay.innerText = fullClock;
-            hudClock.innerText = timeStr;
-        }
-        setInterval(updateClock, 1000);
-        updateClock();
-
-        fpsTimer = setInterval(() => {
+        setInterval(() => {
             const fps = frameCount;
-            fpsCounter.innerText = `${fps.toFixed(1)} FPS`;
-            hudFps.innerText = fps.toFixed(1);
+            fpsBadge.innerText = `${fps.toFixed(1)} FPS`;
+            fpsVal.innerText = `${fps.toFixed(1)} FPS`;
             frameCount = 0;
         }, 1000);
 
-        function setStatus(online, message) {
+        function setStatus(online) {
             if (online) {
-                streamStatusPill.className = "status-pill online";
-                streamStatusDot.className = "dot pulse";
-                streamStatusText.innerText = "STREAM LIVE";
-                standbyOverlay.classList.add("hidden");
+                streamBadge.className = "badge badge-live";
+                streamBadge.innerText = "[ONLINE]";
+                statusVal.innerText = "Online";
+                offlineNotice.classList.add("hidden");
             } else {
-                streamStatusPill.className = "status-pill offline";
-                streamStatusDot.className = "dot";
-                streamStatusText.innerText = message || "FEED OFFLINE";
-                if (!hasReceivedFirstFrame) {
-                    standbyOverlay.classList.remove("hidden");
+                streamBadge.className = "badge";
+                streamBadge.innerText = "[OFFLINE]";
+                statusVal.innerText = "Offline";
+                if (!receivedFirstFrame) {
+                    offlineNotice.classList.remove("hidden");
                 }
             }
         }
@@ -2620,7 +2403,7 @@ LIVE_PAGE_HTML = """
             const protocol = loc.protocol === "https:" ? "wss:" : "ws:";
             const wsUrl = `${protocol}//${loc.host}/ws/live`;
 
-            setStatus(false, "CONNECTING...");
+            setStatus(false);
             try {
                 ws = new WebSocket(wsUrl);
                 ws.binaryType = "blob";
@@ -2632,23 +2415,23 @@ LIVE_PAGE_HTML = """
                 ws.onmessage = function (event) {
                     if (typeof event.data === "string") {
                         try {
-                            const data = JSON.parse(event.data);
-                            if (data.type === "status") {
-                                if (data.cctv_ip) {
-                                    cctvIpDisplay.innerText = data.cctv_ip;
+                            const meta = JSON.parse(event.data);
+                            if (meta.type === "status") {
+                                setStatus(Boolean(meta.online));
+                                if (meta.recording_file) {
+                                    fileVal.innerText = meta.recording_file;
+                                    recBadge.innerText = "[REC: ACTIVE]";
+                                    recVal.innerText = "Active";
+                                } else {
+                                    recBadge.innerText = meta.recording ? "[REC: ACTIVE]" : "[REC: IDLE]";
+                                    recVal.innerText = meta.recording ? "Active" : "Idle";
                                 }
-                                if (data.recording_file) {
-                                    hudRec.innerText = `REC: ${data.recording_file}`;
-                                }
-                                setStatus(Boolean(data.online), data.online ? "STREAM LIVE" : "FEED OFFLINE");
                             }
                         } catch (e) {}
                     } else if (event.data instanceof Blob) {
-                        if (isPaused || document.visibilityState === "hidden") {
-                            return;
-                        }
+                        if (isPaused || document.visibilityState === "hidden") return;
 
-                        hasReceivedFirstFrame = true;
+                        receivedFirstFrame = true;
                         setStatus(true);
 
                         const newUrl = URL.createObjectURL(event.data);
@@ -2659,15 +2442,15 @@ LIVE_PAGE_HTML = """
                         activeBlobUrl = newUrl;
 
                         frameCount++;
-                        totalFramesReceived++;
-                        hudFrames.innerText = totalFramesReceived;
+                        totalFrames++;
+                        framesVal.innerText = totalFrames;
                     }
                 };
 
                 ws.onclose = function () {
-                    setStatus(false, "DISCONNECTED");
+                    setStatus(false);
                     setTimeout(connectWebSocket, reconnectDelay);
-                    reconnectDelay = Math.min(reconnectDelay * 1.5, 5000);
+                    reconnectDelay = Math.min(reconnectDelay * 1.5, 4000);
                 };
 
                 ws.onerror = function () {
@@ -2687,11 +2470,11 @@ LIVE_PAGE_HTML = """
 
         function togglePause() {
             isPaused = !isPaused;
-            pauseBtn.innerText = isPaused ? "▶ Resume" : "⏸ Pause";
+            pauseBtn.innerText = isPaused ? "Resume" : "Pause";
         }
 
         function toggleFullscreen() {
-            const el = document.getElementById("videoWrapper");
+            const el = document.getElementById("videoBox");
             if (!document.fullscreenElement) {
                 el.requestFullscreen().catch(() => {});
             } else {
@@ -2701,7 +2484,7 @@ LIVE_PAGE_HTML = """
 
         function captureSnapshot() {
             if (!liveImg || !liveImg.naturalWidth) {
-                alert("No active camera frame to capture.");
+                alert("No active video frame available.");
                 return;
             }
             const canvas = document.getElementById("snapshotCanvas");
@@ -2712,7 +2495,7 @@ LIVE_PAGE_HTML = """
 
             const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
             const link = document.createElement("a");
-            link.download = `cctv_snapshot_${timestamp}.jpg`;
+            link.download = `cctv_${timestamp}.jpg`;
             link.href = canvas.toDataURL("image/jpeg", 0.95);
             link.click();
         }
@@ -2721,21 +2504,20 @@ LIVE_PAGE_HTML = """
             fetch("/live/recordings")
                 .then(r => r.json())
                 .then(data => {
-                    const tbody = document.getElementById("recordingsTableBody");
+                    const tbody = document.getElementById("recordingsTbody");
                     if (!data.recordings || data.recordings.length === 0) {
-                        tbody.innerHTML = `<tr><td colspan="4" style="text-align:center; color:var(--text-muted); padding:20px;">No live recordings saved yet. Streaming will automatically record continuous segments.</td></tr>`;
+                        tbody.innerHTML = `<tr><td colspan="3" style="text-align:center; color:#555555; padding:12px;">No recordings yet.</td></tr>`;
                         return;
                     }
 
                     tbody.innerHTML = data.recordings.map(rec => `
                         <tr>
-                            <td><span class="rec-filename">${rec.filename}</span></td>
-                            <td>${rec.timestamp}</td>
+                            <td title="${rec.timestamp}">${rec.filename}</td>
                             <td>${rec.size_mb} MB</td>
                             <td>
-                                <div class="rec-actions">
-                                    <button class="rec-btn rec-btn-watch" onclick="watchRecording('${rec.filename}')">▶ Watch</button>
-                                    <a class="rec-btn" href="${rec.url}" download>⬇ Download</a>
+                                <div class="actions-cell">
+                                    <button class="small-btn" onclick="watchRecording('${rec.filename}')">Watch</button>
+                                    <a class="btn-link small-btn" href="${rec.url}" download>Save</a>
                                 </div>
                             </td>
                         </tr>
@@ -2746,8 +2528,8 @@ LIVE_PAGE_HTML = """
 
         function watchRecording(filename) {
             const modal = document.getElementById("videoModal");
-            const title = document.getElementById("modalVideoTitle");
-            const player = document.getElementById("modalVideoPlayer");
+            const title = document.getElementById("modalFilename");
+            const player = document.getElementById("modalPlayer");
             title.innerText = filename;
             player.src = `/live/recordings/${encodeURIComponent(filename)}`;
             modal.classList.add("open");
@@ -2756,7 +2538,7 @@ LIVE_PAGE_HTML = """
 
         function closeModal() {
             const modal = document.getElementById("videoModal");
-            const player = document.getElementById("modalVideoPlayer");
+            const player = document.getElementById("modalPlayer");
             player.pause();
             player.src = "";
             modal.classList.remove("open");
