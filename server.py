@@ -13,6 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 import zlib
+import wave
 
 import requests
 from flask import (
@@ -57,6 +58,12 @@ VIEW_TOKEN = os.getenv("VIEW_TOKEN", "")
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "/root/video/uploads"))
 if not UPLOAD_DIR.is_absolute():
     UPLOAD_DIR = Path(__file__).resolve().parent / UPLOAD_DIR
+try:
+    if UPLOAD_DIR.is_dir():
+        for _orphan in UPLOAD_DIR.glob("_tmp_*"):
+            _orphan.unlink(missing_ok=True)
+except Exception:
+    pass
 MAX_UPLOAD_SIZE = int(os.getenv("MAX_UPLOAD_SIZE", str(500 * 1024 * 1024)))
 EVENT_TOKEN = os.getenv("EVENT_TOKEN", UPLOAD_TOKEN)
 PRODUCT_NAME = os.getenv("PRODUCT_NAME", "ALERTO").upper()
@@ -124,17 +131,23 @@ def find_ffmpeg_binary():
 
 
 class LiveStreamRecorder:
-    """Continuous segmented MP4 video recorder on the server."""
+    """Continuous segmented MP4 video recorder with audio on the server."""
 
-    def __init__(self, output_dir, segment_seconds=600, fps=15):
+    def __init__(self, output_dir, segment_seconds=600, fps=10):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        # Store work-in-progress files in a dedicated hidden folder so UPLOAD_DIR only contains 100% finished MP4s
+        self.temp_dir = self.output_dir / ".live_temp"
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
         self.segment_seconds = segment_seconds
         self.fps = fps
-        self.frame_queue = queue.Queue(maxsize=150)
+        self.frame_queue = queue.Queue(maxsize=300)
+        self.audio_queue = queue.Queue(maxsize=600)
         self.active_proc = None
-        self.active_cv_writer = None
+        self.active_wave_file = None
         self.current_filename = None
+        self.temp_video_path = None
+        self.temp_audio_path = None
         self.segment_start_time = 0
         self.frames_written = 0
         self.total_segments = 0
@@ -161,15 +174,33 @@ class LiveStreamRecorder:
         try:
             self.frame_queue.put_nowait(frame_bytes)
         except queue.Full:
-            pass  # Drop frame rather than accumulating lag
+            pass
 
-    def _start_segment(self, first_frame_bytes=None):
+    def write_audio(self, audio_bytes):
+        if not self.running:
+            self.start()
+        try:
+            self.audio_queue.put_nowait(audio_bytes)
+        except queue.Full:
+            pass
+
+    def _start_segment(self):
         self._close_segment()
         ts = datetime.now(MANILA_TIMEZONE).strftime("%Y-%m-%d_%H-%M-%S")
         self.current_filename = f"live_rec_{ts}.mp4"
-        file_path = self.output_dir / self.current_filename
+        self.temp_video_path = self.temp_dir / f"_v_{ts}.mp4"
+        self.temp_audio_path = self.temp_dir / f"_a_{ts}.wav"
         self.segment_start_time = time.time()
         self.frames_written = 0
+
+        try:
+            self.active_wave_file = wave.open(str(self.temp_audio_path), "wb")
+            self.active_wave_file.setnchannels(1)
+            self.active_wave_file.setsampwidth(2)
+            self.active_wave_file.setframerate(16000)
+        except Exception as e:
+            logger.warning("Could not initialize temporary WAV file: %s", e)
+            self.active_wave_file = None
 
         if self.ffmpeg_bin:
             cmd = [
@@ -181,16 +212,19 @@ class LiveStreamRecorder:
                 "-i", "-",
                 "-c:v", "libx264",
                 "-preset", "ultrafast",
+                "-tune", "zerolatency",
+                "-crf", "24",
                 "-pix_fmt", "yuv420p",
+                "-r", str(self.fps),
                 "-movflags", "+faststart",
-                str(file_path),
+                str(self.temp_video_path),
             ]
             try:
                 self.active_proc = subprocess.Popen(
                     cmd,
                     stdin=subprocess.PIPE,
                     stdout=subprocess.DEVNULL,
-                    stderr=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
                 )
                 logger.info(
                     "Server live recording segment started (FFmpeg): %s",
@@ -198,113 +232,190 @@ class LiveStreamRecorder:
                 )
                 return
             except Exception as e:
-                logger.error(
-                    "Failed to start FFmpeg for live recording: %s. Falling back to OpenCV.",
-                    e,
-                )
+                logger.error("Failed to start FFmpeg for live recording: %s", e)
                 self.active_proc = None
 
-        # Fallback to OpenCV if FFmpeg is unavailable
-        try:
-            import cv2
-            import numpy as np
-
-            nparr = np.frombuffer(first_frame_bytes or b"", np.uint8)
-            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-            if img is not None:
-                h, w = img.shape[:2]
-                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                self.active_cv_writer = cv2.VideoWriter(
-                    str(file_path), fourcc, self.fps, (w, h)
-                )
-                logger.info(
-                    "Server live recording segment started (OpenCV): %s (%dx%d)",
-                    self.current_filename,
-                    w,
-                    h,
-                )
-        except Exception as e:
-            logger.error("OpenCV VideoWriter fallback error: %s", e)
-            self.active_cv_writer = None
-
     def _close_segment(self):
+        # 1. Drain any remaining audio into wave file
+        while True:
+            try:
+                audio_chunk = self.audio_queue.get_nowait()
+                if self.active_wave_file:
+                    self.active_wave_file.writeframes(audio_chunk)
+            except queue.Empty:
+                break
+
+        if self.active_wave_file:
+            try:
+                self.active_wave_file.close()
+            except Exception:
+                pass
+            self.active_wave_file = None
+
+        # 2. Flush and close video pipe
         if self.active_proc:
             try:
                 if self.active_proc.stdin:
                     self.active_proc.stdin.close()
                 self.active_proc.wait(timeout=10)
             except Exception:
-                pass
+                try:
+                    self.active_proc.kill()
+                except Exception:
+                    pass
             self.active_proc = None
 
-        if self.active_cv_writer:
-            try:
-                self.active_cv_writer.release()
-            except Exception:
-                pass
-            self.active_cv_writer = None
+        # 3. Finalize video into UPLOAD_DIR only if it contains enough valid frames
+        if (
+            self.current_filename
+            and self.temp_video_path
+            and self.temp_video_path.is_file()
+            and self.temp_video_path.stat().st_size > 1000
+            and self.frames_written >= 5
+        ):
+            final_target_path = self.output_dir / self.current_filename
+            temp_mux_path = self.temp_dir / f"_mux_{self.current_filename}"
 
-        if self.current_filename:
-            path = self.output_dir / self.current_filename
-            if path.is_file() and path.stat().st_size > 0:
-                size_mb = path.stat().st_size / (1024 * 1024)
+            has_valid_audio = (
+                self.temp_audio_path
+                and self.temp_audio_path.is_file()
+                and self.temp_audio_path.stat().st_size > 4000
+                and self.ffmpeg_bin is not None
+            )
+
+            success = False
+            if has_valid_audio:
+                mux_cmd = [
+                    self.ffmpeg_bin,
+                    "-y",
+                    "-i", str(self.temp_video_path),
+                    "-i", str(self.temp_audio_path),
+                    "-map", "0:v:0",
+                    "-map", "1:a:0",
+                    "-c:v", "copy",
+                    "-c:a", "aac",
+                    "-b:a", "64k",
+                    "-movflags", "+faststart",
+                    str(temp_mux_path),
+                ]
+                try:
+                    res = subprocess.run(
+                        mux_cmd,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=15,
+                    )
+                    if res.returncode == 0 and temp_mux_path.is_file() and temp_mux_path.stat().st_size > 1000:
+                        temp_mux_path.rename(final_target_path)
+                        success = True
+                except Exception as mux_err:
+                    logger.warning("Live segment audio mux failed (%s). Retrying video-only...", mux_err)
+
+            if not success and self.ffmpeg_bin:
+                faststart_cmd = [
+                    self.ffmpeg_bin,
+                    "-y",
+                    "-i", str(self.temp_video_path),
+                    "-c:v", "copy",
+                    "-movflags", "+faststart",
+                    str(temp_mux_path),
+                ]
+                try:
+                    res = subprocess.run(
+                        faststart_cmd,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=15,
+                    )
+                    if res.returncode == 0 and temp_mux_path.is_file() and temp_mux_path.stat().st_size > 1000:
+                        temp_mux_path.rename(final_target_path)
+                        success = True
+                except Exception:
+                    pass
+
+            if not success and self.temp_video_path.is_file():
+                try:
+                    self.temp_video_path.rename(final_target_path)
+                    success = True
+                except Exception:
+                    pass
+
+            if success and final_target_path.is_file():
+                size_mb = final_target_path.stat().st_size / (1024 * 1024)
                 logger.info(
-                    "Server live recording finalized: %s (%.2f MB, %d frames)",
+                    "Server live recording finalized: %s (%.2f MB, %d frames, audio=%s)",
                     self.current_filename,
                     size_mb,
                     self.frames_written,
+                    has_valid_audio,
                 )
                 self.total_segments += 1
                 record_activity(
                     f"[LIVE_RECORD] Segment saved: {self.current_filename} ({size_mb:.1f} MB)",
                     "success",
                 )
-            else:
-                if path.is_file():
-                    try:
-                        path.unlink()
-                    except Exception:
-                        pass
-            self.current_filename = None
+
+        # Cleanup all temp files
+        if self.temp_video_path:
+            self.temp_video_path.unlink(missing_ok=True)
+        if self.temp_audio_path:
+            self.temp_audio_path.unlink(missing_ok=True)
+
+        self.current_filename = None
+        self.temp_video_path = None
+        self.temp_audio_path = None
 
     def _recording_loop(self):
         while self.running:
             try:
-                frame_bytes = self.frame_queue.get(timeout=1.0)
+                frame_bytes = self.frame_queue.get(timeout=0.2)
             except queue.Empty:
+                frame_bytes = None
+
+            # Process queued audio chunks
+            while True:
+                try:
+                    audio_chunk = self.audio_queue.get_nowait()
+                    if self.active_wave_file:
+                        try:
+                            self.active_wave_file.writeframes(audio_chunk)
+                        except Exception:
+                            pass
+                except queue.Empty:
+                    break
+
+            if frame_bytes is None:
                 continue
 
-            now = time.time()
-            if (
-                self.active_proc is None and self.active_cv_writer is None
-            ) or (now - self.segment_start_time) >= self.segment_seconds:
-                self._start_segment(frame_bytes)
+            with self.lock:
+                now = time.time()
+                if self.active_proc is None or (now - self.segment_start_time) >= self.segment_seconds:
+                    self._start_segment()
 
-            if self.active_proc and self.active_proc.stdin:
-                try:
-                    self.active_proc.stdin.write(frame_bytes)
-                    self.frames_written += 1
-                except Exception:
-                    self._close_segment()
-            elif self.active_cv_writer:
-                try:
-                    import cv2
-                    import numpy as np
-
-                    nparr = np.frombuffer(frame_bytes, np.uint8)
-                    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                    if img is not None:
-                        self.active_cv_writer.write(img)
+                if self.active_proc and self.active_proc.stdin:
+                    try:
+                        self.active_proc.stdin.write(frame_bytes)
                         self.frames_written += 1
-                except Exception:
-                    self._close_segment()
+                    except Exception:
+                        self._close_segment()
 
     def finalize_segment(self):
         with self.lock:
+            # Drain and write any remaining frames in queue before finishing
+            while True:
+                try:
+                    frame = self.frame_queue.get_nowait()
+                    if self.active_proc and self.active_proc.stdin:
+                        self.active_proc.stdin.write(frame)
+                        self.frames_written += 1
+                except queue.Empty:
+                    break
+                except Exception:
+                    break
             self._close_segment()
 
     def is_active(self):
-        return bool(self.active_proc or self.active_cv_writer)
+        return bool(self.active_proc)
 
     def get_status(self):
         return {
@@ -319,6 +430,7 @@ class LiveStreamRecorder:
             "total_segments": self.total_segments,
             "segment_duration_seconds": self.segment_seconds,
         }
+
 
 
 # Live video WebSocket broadcaster state
@@ -338,22 +450,26 @@ live_stream_meta = {
 }
 live_stream_lock = threading.Lock()
 live_recorder = LiveStreamRecorder(
-    output_dir=UPLOAD_DIR, segment_seconds=LIVE_SEGMENT_SECONDS, fps=15
+    output_dir=UPLOAD_DIR, segment_seconds=LIVE_SEGMENT_SECONDS, fps=10
 )
 
 
-def broadcast_live_frame(frame_bytes):
+
+def broadcast_live_media(media_bytes):
     with live_viewers_lock:
         clients_copy = list(live_viewers.items())
     for ws, lock in clients_copy:
         # Non-blocking lock acquire: drops frame for slow clients so nobody lags behind!
         if lock.acquire(blocking=False):
             try:
-                ws.send(frame_bytes)
+                ws.send(media_bytes)
             except Exception:
                 pass
             finally:
                 lock.release()
+
+
+broadcast_live_frame = broadcast_live_media
 
 
 def broadcast_live_status():
@@ -1631,9 +1747,13 @@ def save_configuration():
         CCTV_IP,
         recipients,
     )
+    with live_stream_lock:
+        live_stream_meta["cctv_ip"] = CCTV_IP
+    broadcast_live_status()
     broadcast({"type": "configuration", **configuration_payload()})
     record_activity("[CONFIG] System parameters updated and synchronized with active nodes.", "success")
     return jsonify(message="Configuration saved"), 200
+
 
 
 @app.post("/trigger-alert")
@@ -1965,7 +2085,11 @@ def list_videos():
         return jsonify(error="Unauthorized"), 401
 
     videos = sorted(
-        (path for path in UPLOAD_DIR.glob("*.mp4") if path.is_file()),
+        (
+            path
+            for path in UPLOAD_DIR.glob("*.mp4")
+            if path.is_file() and not path.name.startswith("_") and not path.name.startswith(".")
+        ),
         key=lambda path: path.stat().st_mtime,
         reverse=True,
     )
@@ -2332,7 +2456,7 @@ LIVE_PAGE_HTML = """
     <header>
         <div class="header-title">
             <span>LIVE CCTV MONITOR</span>
-            <span class="header-meta">CCTV: {{ cctv_ip }}</span>
+            <span class="header-meta" id="cctvMeta">CCTV: {{ cctv_ip }}</span>
         </div>
         <div class="header-status">
             <span class="badge" id="streamBadge">[OFFLINE]</span>
@@ -2359,6 +2483,7 @@ LIVE_PAGE_HTML = """
                 <div class="btn-group">
                     <button class="btn-primary" onclick="captureSnapshot()">Save Snapshot</button>
                     <button id="pauseBtn" onclick="togglePause()">Pause</button>
+                    <button id="audioBtn" onclick="toggleAudio()">Audio: Muted</button>
                     <button onclick="forceReconnect()">Reconnect</button>
                 </div>
                 <div class="btn-group">
@@ -2389,6 +2514,10 @@ LIVE_PAGE_HTML = """
                     <div class="info-cell">
                         <span class="info-label">Frames</span>
                         <span class="info-val" id="framesVal">0</span>
+                    </div>
+                    <div class="info-cell">
+                        <span class="info-label">Audio</span>
+                        <span class="info-val" id="audioVal">Muted</span>
                     </div>
                     <div class="info-cell" style="grid-column: span 2;">
                         <span class="info-label">Active Recording File</span>
@@ -2450,6 +2579,8 @@ LIVE_PAGE_HTML = """
         const framesVal = document.getElementById("framesVal");
         const fileVal = document.getElementById("fileVal");
         const pauseBtn = document.getElementById("pauseBtn");
+        const audioBtn = document.getElementById("audioBtn");
+        const audioVal = document.getElementById("audioVal");
 
         let ws = null;
         let activeBlobUrl = null;
@@ -2458,6 +2589,30 @@ LIVE_PAGE_HTML = """
         let totalFrames = 0;
         let reconnectDelay = 1000;
         let receivedFirstFrame = false;
+
+        let audioCtx = null;
+        let isAudioMuted = true;
+        let nextAudioPlayTime = 0;
+
+        function toggleAudio() {
+            if (!audioCtx) {
+                const AudioClass = window.AudioContext || window.webkitAudioContext;
+                if (AudioClass) {
+                    audioCtx = new AudioClass({ sampleRate: 16000 });
+                }
+            }
+            if (audioCtx && audioCtx.state === "suspended") {
+                audioCtx.resume();
+            }
+            isAudioMuted = !isAudioMuted;
+            if (audioBtn) {
+                audioBtn.innerText = isAudioMuted ? "Audio: Muted" : "Audio: Live";
+                audioBtn.className = isAudioMuted ? "" : "btn-primary";
+            }
+            if (audioVal) {
+                audioVal.innerText = isAudioMuted ? "Muted" : "Live";
+            }
+        }
 
         setInterval(() => {
             const fps = frameCount;
@@ -2496,12 +2651,16 @@ LIVE_PAGE_HTML = """
                     reconnectDelay = 1000;
                 };
 
-                ws.onmessage = function (event) {
+                ws.onmessage = async function (event) {
                     if (typeof event.data === "string") {
                         try {
                             const meta = JSON.parse(event.data);
                             if (meta.type === "status") {
                                 setStatus(Boolean(meta.online));
+                                if (meta.cctv_ip) {
+                                    const cctvMeta = document.getElementById("cctvMeta");
+                                    if (cctvMeta) cctvMeta.innerText = `CCTV: ${meta.cctv_ip}`;
+                                }
                                 if (meta.recording_file) {
                                     fileVal.innerText = meta.recording_file;
                                     recBadge.innerText = "[REC: ACTIVE]";
@@ -2513,21 +2672,53 @@ LIVE_PAGE_HTML = """
                             }
                         } catch (e) {}
                     } else if (event.data instanceof Blob) {
-                        if (isPaused || document.visibilityState === "hidden") return;
+                        const buffer = await event.data.arrayBuffer();
+                        const view = new Uint8Array(buffer);
+                        if (!view.length) return;
 
-                        receivedFirstFrame = true;
-                        setStatus(true);
+                        if (view[0] === 0x41) {
+                            // 'A' = 16kHz 16-bit mono PCM Audio Chunk
+                            if (isAudioMuted || !audioCtx) return;
+                            const pcm16 = new Int16Array(buffer.slice(1));
+                            if (!pcm16.length) return;
 
-                        const newUrl = URL.createObjectURL(event.data);
-                        liveImg.src = newUrl;
-                        if (activeBlobUrl) {
-                            URL.revokeObjectURL(activeBlobUrl);
+                            const f32 = new Float32Array(pcm16.length);
+                            for (let i = 0; i < pcm16.length; i++) {
+                                f32[i] = pcm16[i] / 32768.0;
+                            }
+
+                            const aBuf = audioCtx.createBuffer(1, f32.length, 16000);
+                            aBuf.copyToChannel(f32, 0);
+
+                            const src = audioCtx.createBufferSource();
+                            src.buffer = aBuf;
+                            src.connect(audioCtx.destination);
+
+                            const now = audioCtx.currentTime;
+                            if (nextAudioPlayTime < now) {
+                                nextAudioPlayTime = now;
+                            }
+                            src.start(nextAudioPlayTime);
+                            nextAudioPlayTime += aBuf.duration;
+                        } else {
+                            // 'V' = Video frame (or raw JPEG)
+                            if (isPaused || document.visibilityState === "hidden") return;
+
+                            const videoBlob = (view[0] === 0x56) ? event.data.slice(1) : event.data;
+                            receivedFirstFrame = true;
+                            setStatus(true);
+
+                            const newUrl = URL.createObjectURL(videoBlob);
+                            liveImg.src = newUrl;
+                            if (activeBlobUrl) {
+                                URL.revokeObjectURL(activeBlobUrl);
+                            }
+                            activeBlobUrl = newUrl;
+
+                            frameCount++;
+                            totalFrames++;
+                            framesVal.innerText = totalFrames;
                         }
-                        activeBlobUrl = newUrl;
-
-                        frameCount++;
-                        totalFrames++;
-                        framesVal.innerText = totalFrames;
                     }
                 };
 
@@ -2681,29 +2872,37 @@ def live_feed_inlet(ws):
                 except Exception:
                     pass
             elif isinstance(data, bytes):
-                frame_counter += 1
-                now = time.time()
-                if now - last_fps_calc >= 2.0:
-                    fps = frame_counter / (now - last_fps_calc)
+                if not data:
+                    continue
+                tag = data[0]
+                if tag == 0x41:  # 'A' = Audio chunk (16kHz mono PCM)
+                    audio_payload = data[1:]
+                    broadcast_live_media(data)
+                    if LIVE_RECORDING_ENABLED:
+                        live_recorder.write_audio(audio_payload)
+                else:  # 'V' = Video frame (or legacy JPEG)
+                    video_payload = data[1:] if tag == 0x56 else data
+                    frame_counter += 1
+                    now = time.time()
+                    if now - last_fps_calc >= 2.0:
+                        fps = frame_counter / (now - last_fps_calc)
+                        with live_stream_lock:
+                            live_stream_meta["fps"] = round(fps, 1)
+                        frame_counter = 0
+                        last_fps_calc = now
+
+                    with latest_live_frame_lock:
+                        global latest_live_frame
+                        latest_live_frame = video_payload
+
                     with live_stream_lock:
-                        live_stream_meta["fps"] = round(fps, 1)
-                    frame_counter = 0
-                    last_fps_calc = now
+                        live_stream_meta["frames_received"] += 1
+                        live_stream_meta["bytes_received"] += len(video_payload)
 
-                with latest_live_frame_lock:
-                    global latest_live_frame
-                    latest_live_frame = data
+                    broadcast_live_media(data if tag == 0x56 else b"V" + data)
+                    if LIVE_RECORDING_ENABLED:
+                        live_recorder.write_frame(video_payload)
 
-                with live_stream_lock:
-                    live_stream_meta["frames_received"] += 1
-                    live_stream_meta["bytes_received"] += len(data)
-
-                # Broadcast to browser clients with non-blocking locks
-                broadcast_live_frame(data)
-
-                # Record frame to server storage
-                if LIVE_RECORDING_ENABLED:
-                    live_recorder.write_frame(data)
     except Exception as err:
         logger.warning("Live feed connection error: %s", err)
     finally:
@@ -2735,7 +2934,7 @@ def live_viewer_outlet(ws):
             ws.send(json.dumps(status_payload))
             with latest_live_frame_lock:
                 if latest_live_frame is not None:
-                    ws.send(latest_live_frame)
+                    ws.send(b"V" + latest_live_frame)
 
         while True:
             msg = ws.receive()
@@ -2795,7 +2994,11 @@ def live_mjpeg_stream():
 def list_live_recordings():
     try:
         files = sorted(
-            (p for p in UPLOAD_DIR.glob("*.mp4") if p.is_file()),
+            (
+                p
+                for p in UPLOAD_DIR.glob("*.mp4")
+                if p.is_file() and not p.name.startswith("_") and not p.name.startswith(".")
+            ),
             key=lambda p: p.stat().st_mtime,
             reverse=True,
         )

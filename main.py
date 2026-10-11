@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import shutil
+import socket
 import subprocess
 import threading
 import time
@@ -86,6 +87,14 @@ def sync_server_env_to_config():
 
         # IMPORTANT: replace stale values instead of os.environ.setdefault().
         os.environ.update(parsed)
+        global CCTV_IP, VIDEO_DURATION_SECONDS
+        if parsed.get("CCTV_IP"):
+            CCTV_IP = parsed["CCTV_IP"]
+        if parsed.get("VIDEO_DURATION_SECONDS"):
+            try:
+                VIDEO_DURATION_SECONDS = int(parsed["VIDEO_DURATION_SECONDS"])
+            except (ValueError, TypeError):
+                pass
 
         logger.info(
             "Server configuration synchronized: CCTV_IP=%s duration=%ss",
@@ -118,8 +127,10 @@ CCTV_IP = os.getenv("CCTV_IP", "192.168.100.57")
 RTSP_USER = os.getenv("RTSP_USER", "admin")
 RTSP_PASS = os.getenv("RTSP_PASS", "password")
 ENABLE_LIVE_STREAM = os.getenv("ENABLE_LIVE_STREAM", "true").lower() in {"1", "true", "yes", "on"}
-LIVE_STREAM_FPS = int(os.getenv("LIVE_STREAM_FPS", "15"))
-LIVE_STREAM_QUALITY = int(os.getenv("LIVE_STREAM_QUALITY", "75"))
+LIVE_STREAM_FPS = max(1, min(30, int(os.getenv("LIVE_STREAM_FPS", "10"))))
+LIVE_STREAM_HEIGHT = int(os.getenv("LIVE_STREAM_HEIGHT", "480"))
+LIVE_STREAM_QSCALE = max(1, min(31, int(os.getenv("LIVE_STREAM_QSCALE", "9"))))
+LIVE_STREAM_QUALITY = max(10, min(100, int(os.getenv("LIVE_STREAM_QUALITY", "60"))))
 live_stream_pause_event = threading.Event()
 
 
@@ -221,6 +232,10 @@ def record_cctv_stream(filename, duration_seconds, cctv_ip=None):
                 "0:v:0",
                 "-c:v",
                 "copy",
+                "-map",
+                "0:a?",
+                "-c:a",
+                "aac",
                 "-movflags",
                 "+faststart",
                 filename,
@@ -425,34 +440,154 @@ def run_live_stream_service():
         last_stat_log = time.time()
         active_ip = current_ip
 
+        ws_lock = threading.Lock()
+
+        def send_ws_media(tagged_payload):
+            with ws_lock:
+                if ws and ws.connected:
+                    try:
+                        ws.send_binary(tagged_payload)
+                        return True
+                    except Exception:
+                        return False
+                return False
+
+        audio_srv = None
+        audio_conn = None
+        audio_thread = None
+        stop_audio_event = threading.Event()
+
         try:
             if ffmpeg_bin:
-                # Primary Engine: Native FFmpeg piped MJPEG (lightning fast, pure C, Termux prebuilt)
-                cmd = [
-                    ffmpeg_bin,
-                    "-rtsp_transport",
-                    "tcp",
-                    "-i",
-                    rtsp_url,
+                # Video output pipe configuration
+                video_args = [
+                    "-map",
+                    "0:v:0",
                     "-r",
                     str(LIVE_STREAM_FPS),
+                ]
+                if LIVE_STREAM_HEIGHT > 0:
+                    video_args.extend(["-vf", f"scale=-2:{LIVE_STREAM_HEIGHT}"])
+                video_args.extend([
                     "-f",
                     "image2pipe",
                     "-vcodec",
                     "mjpeg",
                     "-q:v",
-                    "5",
+                    str(LIVE_STREAM_QSCALE),
                     "-",
-                ]
-                proc = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
-                )
-                logger.info(
-                    "Live stream: Started FFmpeg RTSP capture pipe (FPS=%d)",
-                    LIVE_STREAM_FPS,
-                )
+                ])
+
+                # Local TCP audio socket for single-process low-latency audio capture
+                try:
+                    audio_srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    audio_srv.bind(("127.0.0.1", 0))
+                    audio_srv.listen(1)
+                    audio_srv.settimeout(0.2)
+                    audio_port = audio_srv.getsockname()[1]
+                except Exception as srv_err:
+                    logger.warning("Could not bind audio receiver socket: %s", srv_err)
+                    audio_srv = None
+
+                has_audio = False
+                if audio_srv is not None:
+                    audio_args = [
+                        "-map",
+                        "0:a:0",
+                        "-vn",
+                        "-ac",
+                        "1",
+                        "-ar",
+                        "16000",
+                        "-f",
+                        "s16le",
+                        f"tcp://127.0.0.1:{audio_port}",
+                    ]
+                    dual_cmd = [
+                        ffmpeg_bin,
+                        "-rtsp_transport",
+                        "tcp",
+                        "-i",
+                        rtsp_url,
+                    ] + video_args + audio_args
+
+                    proc = subprocess.Popen(
+                        dual_cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL,
+                    )
+
+                    t_start = time.time()
+                    while time.time() - t_start < 2.5:
+                        if proc.poll() is not None:
+                            break
+                        try:
+                            audio_conn, _ = audio_srv.accept()
+                            has_audio = True
+                            break
+                        except socket.timeout:
+                            pass
+
+                if not has_audio or (proc and proc.poll() is not None):
+                    if audio_srv:
+                        try:
+                            audio_srv.close()
+                        except Exception:
+                            pass
+                        audio_srv = None
+
+                    if proc and proc.poll() is None:
+                        try:
+                            proc.terminate()
+                            proc.wait(timeout=1)
+                        except Exception:
+                            pass
+
+                    # Fallback: Video-only RTSP capture
+                    video_only_cmd = [
+                        ffmpeg_bin,
+                        "-rtsp_transport",
+                        "tcp",
+                        "-i",
+                        rtsp_url,
+                    ] + video_args
+                    proc = subprocess.Popen(
+                        video_only_cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    logger.info(
+                        "Live stream: Started FFmpeg RTSP video capture (FPS=%d, audio=none)",
+                        LIVE_STREAM_FPS,
+                    )
+                else:
+                    logger.info(
+                        "Live stream: Started FFmpeg RTSP video + audio capture (FPS=%d, audio=16kHz mono)",
+                        LIVE_STREAM_FPS,
+                    )
+
+                    def audio_relay_worker():
+                        try:
+                            while not stop_audio_event.is_set():
+                                chunk = audio_conn.recv(1024)
+                                if not chunk:
+                                    break
+                                if not send_ws_media(b"A" + chunk):
+                                    break
+                        except Exception:
+                            pass
+                        finally:
+                            try:
+                                audio_conn.close()
+                            except Exception:
+                                pass
+
+                    audio_thread = threading.Thread(
+                        target=audio_relay_worker,
+                        daemon=True,
+                        name="LiveAudioRelay",
+                    )
+                    audio_thread.start()
 
                 buffer = bytearray()
                 while True:
@@ -506,13 +641,18 @@ def run_live_stream_service():
                         if next_soi != -1 and next_eoi != -1:
                             continue
 
-                        ws.send_binary(jpeg_frame)
+                        if not send_ws_media(b"V" + jpeg_frame):
+                            raise ConnectionError("Live stream WebSocket connection closed")
                         frame_counter += 1
 
                         now = time.time()
                         if now - last_stat_log >= 15.0:
                             fps = frame_counter / (now - last_stat_log)
-                            logger.info("Live stream active: %.1f FPS to server", fps)
+                            logger.info(
+                                "Live stream active: %.1f FPS to server (audio=%s)",
+                                fps,
+                                "live" if has_audio else "none",
+                            )
                             frame_counter = 0
                             last_stat_log = now
 
@@ -545,11 +685,18 @@ def run_live_stream_service():
                         time.sleep(0.02)
                         continue
 
+                    if LIVE_STREAM_HEIGHT > 0 and frame.shape[0] > LIVE_STREAM_HEIGHT:
+                        aspect = frame.shape[1] / frame.shape[0]
+                        new_w = int(LIVE_STREAM_HEIGHT * aspect)
+                        new_w = new_w if new_w % 2 == 0 else new_w + 1
+                        frame = cv2.resize(frame, (new_w, LIVE_STREAM_HEIGHT), interpolation=cv2.INTER_AREA)
+
                     ret, jpeg_buf = cv2.imencode(".jpg", frame, encode_params)
                     if not ret:
                         continue
 
-                    ws.send_binary(jpeg_buf.tobytes())
+                    if not send_ws_media(b"V" + jpeg_buf.tobytes()):
+                        break
                     frame_counter += 1
 
                     now = time.time()
@@ -570,6 +717,19 @@ def run_live_stream_service():
                 stream_err,
             )
         finally:
+            stop_audio_event.set()
+            if audio_conn:
+                try:
+                    audio_conn.close()
+                except Exception:
+                    pass
+            if audio_srv:
+                try:
+                    audio_srv.close()
+                except Exception:
+                    pass
+            if audio_thread and audio_thread.is_alive():
+                audio_thread.join(timeout=1.0)
             if proc:
                 try:
                     proc.terminate()
@@ -592,7 +752,7 @@ def run_live_stream_service():
 def _configuration_sync_loop():
     """Refresh configuration without blocking event polling."""
     while True:
-        time.sleep(10)
+        time.sleep(5)
         sync_server_env_to_config()
 
 
