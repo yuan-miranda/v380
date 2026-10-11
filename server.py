@@ -5,6 +5,9 @@ import struct
 import threading
 import time
 import uuid
+import queue
+import shutil
+import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -104,6 +107,280 @@ _first_press_lock = threading.Lock()
 # Each WebSocket has its own send lock so one slow client cannot serialize all clients.
 clients = {}
 clients_lock = threading.Lock()
+
+LIVE_RECORDING_ENABLED = os.getenv("LIVE_RECORDING_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+LIVE_SEGMENT_SECONDS = int(os.getenv("LIVE_SEGMENT_SECONDS", "600"))  # default 10 minutes per recorded segment
+
+
+def find_ffmpeg_binary():
+    bin_path = shutil.which(os.getenv("FFMPEG_PATH", "ffmpeg"))
+    if bin_path:
+        return bin_path
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+
+class LiveStreamRecorder:
+    """Continuous segmented MP4 video recorder on the server."""
+
+    def __init__(self, output_dir, segment_seconds=600, fps=15):
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.segment_seconds = segment_seconds
+        self.fps = fps
+        self.frame_queue = queue.Queue(maxsize=150)
+        self.active_proc = None
+        self.active_cv_writer = None
+        self.current_filename = None
+        self.segment_start_time = 0
+        self.frames_written = 0
+        self.total_segments = 0
+        self.running = False
+        self.worker_thread = None
+        self.lock = threading.Lock()
+        self.ffmpeg_bin = find_ffmpeg_binary()
+
+    def start(self):
+        with self.lock:
+            if self.running:
+                return
+            self.running = True
+            self.worker_thread = threading.Thread(
+                target=self._recording_loop,
+                daemon=True,
+                name="LiveRecorderWorker",
+            )
+            self.worker_thread.start()
+
+    def write_frame(self, frame_bytes):
+        if not self.running:
+            self.start()
+        try:
+            self.frame_queue.put_nowait(frame_bytes)
+        except queue.Full:
+            pass  # Drop frame rather than accumulating lag
+
+    def _start_segment(self, first_frame_bytes=None):
+        self._close_segment()
+        ts = datetime.now(MANILA_TIMEZONE).strftime("%Y-%m-%d_%H-%M-%S")
+        self.current_filename = f"live_rec_{ts}.mp4"
+        file_path = self.output_dir / self.current_filename
+        self.segment_start_time = time.time()
+        self.frames_written = 0
+
+        if self.ffmpeg_bin:
+            cmd = [
+                self.ffmpeg_bin,
+                "-y",
+                "-f", "image2pipe",
+                "-vcodec", "mjpeg",
+                "-r", str(self.fps),
+                "-i", "-",
+                "-c:v", "libx264",
+                "-preset", "ultrafast",
+                "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
+                str(file_path),
+            ]
+            try:
+                self.active_proc = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                )
+                logger.info(
+                    "Server live recording segment started (FFmpeg): %s",
+                    self.current_filename,
+                )
+                return
+            except Exception as e:
+                logger.error(
+                    "Failed to start FFmpeg for live recording: %s. Falling back to OpenCV.",
+                    e,
+                )
+                self.active_proc = None
+
+        # Fallback to OpenCV if FFmpeg is unavailable
+        try:
+            import cv2
+            import numpy as np
+
+            nparr = np.frombuffer(first_frame_bytes or b"", np.uint8)
+            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            if img is not None:
+                h, w = img.shape[:2]
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                self.active_cv_writer = cv2.VideoWriter(
+                    str(file_path), fourcc, self.fps, (w, h)
+                )
+                logger.info(
+                    "Server live recording segment started (OpenCV): %s (%dx%d)",
+                    self.current_filename,
+                    w,
+                    h,
+                )
+        except Exception as e:
+            logger.error("OpenCV VideoWriter fallback error: %s", e)
+            self.active_cv_writer = None
+
+    def _close_segment(self):
+        if self.active_proc:
+            try:
+                if self.active_proc.stdin:
+                    self.active_proc.stdin.close()
+                self.active_proc.wait(timeout=10)
+            except Exception:
+                pass
+            self.active_proc = None
+
+        if self.active_cv_writer:
+            try:
+                self.active_cv_writer.release()
+            except Exception:
+                pass
+            self.active_cv_writer = None
+
+        if self.current_filename:
+            path = self.output_dir / self.current_filename
+            if path.is_file() and path.stat().st_size > 0:
+                size_mb = path.stat().st_size / (1024 * 1024)
+                logger.info(
+                    "Server live recording finalized: %s (%.2f MB, %d frames)",
+                    self.current_filename,
+                    size_mb,
+                    self.frames_written,
+                )
+                self.total_segments += 1
+                record_activity(
+                    f"[LIVE_RECORD] Segment saved: {self.current_filename} ({size_mb:.1f} MB)",
+                    "success",
+                )
+            else:
+                if path.is_file():
+                    try:
+                        path.unlink()
+                    except Exception:
+                        pass
+            self.current_filename = None
+
+    def _recording_loop(self):
+        while self.running:
+            try:
+                frame_bytes = self.frame_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+
+            now = time.time()
+            if (
+                self.active_proc is None and self.active_cv_writer is None
+            ) or (now - self.segment_start_time) >= self.segment_seconds:
+                self._start_segment(frame_bytes)
+
+            if self.active_proc and self.active_proc.stdin:
+                try:
+                    self.active_proc.stdin.write(frame_bytes)
+                    self.frames_written += 1
+                except Exception:
+                    self._close_segment()
+            elif self.active_cv_writer:
+                try:
+                    import cv2
+                    import numpy as np
+
+                    nparr = np.frombuffer(frame_bytes, np.uint8)
+                    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                    if img is not None:
+                        self.active_cv_writer.write(img)
+                        self.frames_written += 1
+                except Exception:
+                    self._close_segment()
+
+    def finalize_segment(self):
+        with self.lock:
+            self._close_segment()
+
+    def is_active(self):
+        return bool(self.active_proc or self.active_cv_writer)
+
+    def get_status(self):
+        return {
+            "active": self.is_active(),
+            "filename": self.current_filename,
+            "elapsed_seconds": (
+                int(time.time() - self.segment_start_time)
+                if self.segment_start_time
+                else 0
+            ),
+            "frames_written": self.frames_written,
+            "total_segments": self.total_segments,
+            "segment_duration_seconds": self.segment_seconds,
+        }
+
+
+# Live video WebSocket broadcaster state
+live_viewers = {}               # ws -> threading.Lock()
+live_viewers_lock = threading.Lock()
+latest_live_frame = None        # bytes (JPEG)
+latest_live_frame_lock = threading.Lock()
+live_stream_meta = {
+    "online": False,
+    "cctv_ip": CCTV_IP,
+    "fps": 0.0,
+    "width": 0,
+    "height": 0,
+    "connected_at": None,
+    "frames_received": 0,
+    "bytes_received": 0,
+}
+live_stream_lock = threading.Lock()
+live_recorder = LiveStreamRecorder(
+    output_dir=UPLOAD_DIR, segment_seconds=LIVE_SEGMENT_SECONDS, fps=15
+)
+
+
+def broadcast_live_frame(frame_bytes):
+    with live_viewers_lock:
+        clients_copy = list(live_viewers.items())
+    for ws, lock in clients_copy:
+        # Non-blocking lock acquire: drops frame for slow clients so nobody lags behind!
+        if lock.acquire(blocking=False):
+            try:
+                ws.send(frame_bytes)
+            except Exception:
+                pass
+            finally:
+                lock.release()
+
+
+def broadcast_live_status():
+    with live_stream_lock:
+        meta_copy = dict(live_stream_meta)
+    with live_viewers_lock:
+        viewers_count = len(live_viewers)
+        clients_copy = list(live_viewers.items())
+
+    payload = json.dumps(
+        {
+            "type": "status",
+            **meta_copy,
+            "viewers_count": viewers_count,
+            "recording": live_recorder.is_active(),
+            "recording_file": live_recorder.current_filename,
+        }
+    )
+    for ws, lock in clients_copy:
+        if lock.acquire(blocking=False):
+            try:
+                ws.send(payload)
+            except Exception:
+                pass
+            finally:
+                lock.release()
+
 
 activity_logs = []
 activity_lock = threading.Lock()
@@ -512,7 +789,7 @@ WEB_PAGE = """
     <div class="container">
         <h2>{{ product_name }}</h2><p class="subtitle">Emergency Reporting System</p>
         <div class="button-stack"><button class="btn-hazard" id="btn-1" type="button"><span class="btn-label">Hazard</span><span class="armed-badge" id="badge-1"></span><div class="hold-progress" id="progress-1"></div></button><button class="btn-security" id="btn-2" type="button"><span class="btn-label">Security</span><span class="armed-badge" id="badge-2"></span><div class="hold-progress" id="progress-2"></div></button><button class="btn-medical" id="btn-3" type="button"><span class="btn-label">Medical Concern</span><span class="armed-badge" id="badge-3"></span><div class="hold-progress" id="progress-3"></div></button><button class="btn-disarm" type="button" onclick="disarmAlarm()">Disarm Alarm</button></div>
-        <section class="activity-log"><div class="log-header"><span>Activity log</span><div class="log-actions"><button class="log-action" id="log-state" type="button" disabled>Ready</button><button class="log-action" type="button" onclick="clearLog()">Clear log</button><button class="log-action" type="button" onclick="document.getElementById('configuration').classList.toggle('open')">Configuration</button></div></div><div id="status"><div class="log-empty">No alerts recorded in this session.</div></div></section>
+        <section class="activity-log"><div class="log-header"><span>Activity log</span><div class="log-actions"><a class="log-action" href="/live" target="_blank" style="text-decoration:none;display:inline-flex;align-items:center;background:#0284c7;color:#ffffff;border-radius:2px;">Live Feed</a><button class="log-action" id="log-state" type="button" disabled>Ready</button><button class="log-action" type="button" onclick="clearLog()">Clear log</button><button class="log-action" type="button" onclick="document.getElementById('configuration').classList.toggle('open')">Configuration</button></div></div><div id="status"><div class="log-empty">No alerts recorded in this session.</div></div></section>
         <form class="configuration" id="configuration" onsubmit="saveConfiguration(event)">
             <label for="cctv_ip">CCTV IP Address</label>
             <input id="cctv_ip" type="text" value="{{ cctv_ip }}" required>
@@ -1649,6 +1926,1044 @@ def watch_video(filename):
         abort(404)
 
     return send_from_directory(UPLOAD_DIR, safe_filename.name, mimetype="video/mp4")
+
+
+LIVE_PAGE_HTML = """
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>{{ product_name }} Live CCTV Surveillance</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#090d16">
+    <link rel="icon" type="image/png" href="/icon-192.png">
+    <style>
+        :root {
+            --bg-base: #070a13;
+            --bg-card: rgba(15, 23, 42, 0.85);
+            --border-color: rgba(255, 255, 255, 0.08);
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+            --accent-green: #10b981;
+            --accent-red: #ef4444;
+            --accent-blue: #0284c7;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Inter", Helvetica, Arial, sans-serif;
+            background: var(--bg-base);
+            color: var(--text-main);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow-x: hidden;
+        }
+        .header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 16px 24px;
+            background: rgba(11, 16, 30, 0.95);
+            border-bottom: 1px solid var(--border-color);
+            position: sticky;
+            top: 0;
+            z-index: 50;
+            backdrop-filter: blur(10px);
+        }
+        .header-brand {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        .brand-badge {
+            background: linear-gradient(135deg, #b91c1c, #dc2626);
+            color: white;
+            font-size: 11px;
+            font-weight: 800;
+            padding: 4px 8px;
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+            border-radius: 4px;
+        }
+        .brand-title {
+            font-size: 18px;
+            font-weight: 700;
+            letter-spacing: -0.02em;
+            color: #ffffff;
+        }
+        .header-status-group {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        .status-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 5px 12px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 600;
+            letter-spacing: 0.03em;
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid var(--border-color);
+        }
+        .status-pill.online {
+            background: rgba(16, 185, 129, 0.12);
+            color: #34d399;
+            border-color: rgba(16, 185, 129, 0.3);
+        }
+        .status-pill.offline {
+            background: rgba(239, 68, 68, 0.12);
+            color: #f87171;
+            border-color: rgba(239, 68, 68, 0.3);
+        }
+        .status-pill.rec {
+            background: rgba(220, 38, 38, 0.15);
+            color: #fca5a5;
+            border-color: rgba(220, 38, 38, 0.4);
+        }
+        .dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: currentColor;
+        }
+        .pulse {
+            animation: pulseAnim 1.6s infinite ease-in-out;
+        }
+        @keyframes pulseAnim {
+            0% { transform: scale(0.9); opacity: 0.7; }
+            50% { transform: scale(1.3); opacity: 1; }
+            100% { transform: scale(0.9); opacity: 0.7; }
+        }
+        .header-nav {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .nav-btn {
+            background: rgba(255, 255, 255, 0.06);
+            color: var(--text-main);
+            text-decoration: none;
+            padding: 7px 14px;
+            border-radius: 6px;
+            font-size: 13px;
+            font-weight: 600;
+            border: 1px solid var(--border-color);
+            transition: all 0.15s ease;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .nav-btn:hover {
+            background: rgba(255, 255, 255, 0.12);
+            border-color: rgba(255, 255, 255, 0.2);
+        }
+
+        .main-container {
+            max-width: 1360px;
+            width: 100%;
+            margin: 0 auto;
+            padding: 24px;
+            display: flex;
+            flex-direction: column;
+            gap: 24px;
+        }
+
+        .viewport-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+            display: flex;
+            flex-direction: column;
+        }
+        .viewport-header {
+            padding: 12px 18px;
+            background: rgba(15, 23, 42, 0.95);
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text-muted);
+        }
+        .camera-info {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            color: #f1f5f9;
+        }
+        .ip-pill {
+            font-family: ui-monospace, SFMono-Regular, monospace;
+            background: rgba(2, 132, 199, 0.15);
+            color: #38bdf8;
+            padding: 2px 7px;
+            border-radius: 4px;
+            font-size: 11px;
+            letter-spacing: 0.05em;
+        }
+
+        .video-wrapper {
+            position: relative;
+            width: 100%;
+            aspect-ratio: 16 / 9;
+            background: #030712;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+        }
+        #liveVideo {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            display: block;
+            background: #000;
+        }
+
+        .hud-overlay {
+            position: absolute;
+            inset: 0;
+            pointer-events: none;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            padding: 16px;
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9), 0 0 8px rgba(0,0,0,0.8);
+        }
+        .hud-top {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+        }
+        .hud-bottom {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-end;
+        }
+        .hud-tag {
+            background: rgba(0, 0, 0, 0.65);
+            backdrop-filter: blur(4px);
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            color: #f8fafc;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .standby-overlay {
+            position: absolute;
+            inset: 0;
+            background: rgba(7, 10, 19, 0.92);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 16px;
+            text-align: center;
+            padding: 24px;
+            z-index: 10;
+            transition: opacity 0.3s ease;
+        }
+        .standby-overlay.hidden {
+            display: none;
+        }
+        .radar-box {
+            position: relative;
+            width: 80px;
+            height: 80px;
+            border: 2px solid rgba(2, 132, 199, 0.3);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .radar-box::after {
+            content: "";
+            position: absolute;
+            inset: 6px;
+            border: 2px dashed rgba(2, 132, 199, 0.6);
+            border-radius: 50%;
+            animation: radarRotate 4s linear infinite;
+        }
+        @keyframes radarRotate {
+            to { transform: rotate(360deg); }
+        }
+        .radar-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #0284c7;
+            box-shadow: 0 0 15px #38bdf8;
+            animation: pulseAnim 1.4s infinite ease-in-out;
+        }
+        .standby-title {
+            font-size: 18px;
+            font-weight: 700;
+            color: #f8fafc;
+        }
+        .standby-desc {
+            font-size: 13px;
+            color: var(--text-muted);
+            max-width: 480px;
+            line-height: 1.5;
+        }
+        .code-snippet {
+            background: rgba(15, 23, 42, 0.9);
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            padding: 8px 14px;
+            border-radius: 6px;
+            font-family: ui-monospace, SFMono-Regular, monospace;
+            font-size: 12px;
+            color: #38bdf8;
+            user-select: all;
+        }
+
+        .controls-bar {
+            padding: 12px 18px;
+            background: rgba(15, 23, 42, 0.95);
+            border-top: 1px solid var(--border-color);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 12px;
+        }
+        .controls-left, .controls-right {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .ctrl-btn {
+            background: rgba(255, 255, 255, 0.06);
+            color: #f8fafc;
+            border: 1px solid var(--border-color);
+            padding: 8px 14px;
+            border-radius: 6px;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            transition: all 0.15s ease;
+            user-select: none;
+            text-decoration: none;
+        }
+        .ctrl-btn:hover {
+            background: rgba(255, 255, 255, 0.12);
+            border-color: rgba(255, 255, 255, 0.2);
+        }
+        .ctrl-btn:active {
+            transform: scale(0.97);
+        }
+
+        .recordings-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 20px 24px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+        .recordings-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 10px;
+            padding-bottom: 12px;
+            border-bottom: 1px solid var(--border-color);
+        }
+        .recordings-title {
+            font-size: 16px;
+            font-weight: 700;
+            color: #f8fafc;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .table-responsive {
+            width: 100%;
+            overflow-x: auto;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 13px;
+            text-align: left;
+        }
+        th {
+            padding: 10px 14px;
+            color: var(--text-muted);
+            font-weight: 600;
+            border-bottom: 1px solid var(--border-color);
+            text-transform: uppercase;
+            font-size: 11px;
+            letter-spacing: 0.05em;
+        }
+        td {
+            padding: 12px 14px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+            color: #e2e8f0;
+        }
+        tr:hover td {
+            background: rgba(255, 255, 255, 0.03);
+        }
+        .rec-filename {
+            font-family: ui-monospace, SFMono-Regular, monospace;
+            font-weight: 600;
+            color: #38bdf8;
+        }
+        .rec-actions {
+            display: flex;
+            gap: 8px;
+        }
+        .rec-btn {
+            padding: 5px 10px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: 600;
+            text-decoration: none;
+            border: 1px solid var(--border-color);
+            background: rgba(255, 255, 255, 0.05);
+            color: #f1f5f9;
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            transition: all 0.15s ease;
+        }
+        .rec-btn:hover {
+            background: rgba(255, 255, 255, 0.12);
+        }
+        .rec-btn-watch {
+            background: rgba(2, 132, 199, 0.2);
+            color: #7dd3fc;
+            border-color: rgba(2, 132, 199, 0.4);
+        }
+
+        .modal-backdrop {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.85);
+            backdrop-filter: blur(8px);
+            z-index: 100;
+            align-items: center;
+            justify-content: center;
+            padding: 24px;
+        }
+        .modal-backdrop.open {
+            display: flex;
+        }
+        .modal-box {
+            background: #0f172a;
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            width: 100%;
+            max-width: 900px;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            box-shadow: 0 20px 50px rgba(0,0,0,0.8);
+        }
+        .modal-header {
+            padding: 14px 18px;
+            background: #1e293b;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .modal-title {
+            font-size: 14px;
+            font-weight: 700;
+            color: #f8fafc;
+            font-family: ui-monospace, SFMono-Regular, monospace;
+        }
+        .modal-close {
+            background: none;
+            border: none;
+            color: #94a3b8;
+            font-size: 20px;
+            font-weight: bold;
+            cursor: pointer;
+        }
+        .modal-video-wrap {
+            width: 100%;
+            aspect-ratio: 16 / 9;
+            background: #000;
+        }
+        .modal-video-wrap video {
+            width: 100%;
+            height: 100%;
+            display: block;
+        }
+
+        @media (max-width: 768px) {
+            .header { padding: 12px 16px; flex-direction: column; align-items: flex-start; gap: 10px; }
+            .header-status-group { width: 100%; justify-content: space-between; }
+            .main-container { padding: 16px; gap: 16px; }
+            .controls-bar { flex-direction: column; align-items: stretch; }
+            .controls-left, .controls-right { justify-content: space-around; width: 100%; }
+        }
+    </style>
+</head>
+<body>
+    <header class="header">
+        <div class="header-brand">
+            <span class="brand-badge">{{ product_name }}</span>
+            <span class="brand-title">Live CCTV Surveillance</span>
+        </div>
+        <div class="header-status-group">
+            <div class="status-pill offline" id="streamStatusPill">
+                <span class="dot" id="streamStatusDot"></span>
+                <span id="streamStatusText">CONNECTING...</span>
+            </div>
+            <div class="status-pill rec" id="recStatusPill">
+                <span class="dot pulse"></span>
+                <span id="recStatusText">REC ON SERVER</span>
+            </div>
+            <div class="status-pill" id="fpsPill">
+                <span id="fpsCounter">0.0 FPS</span>
+            </div>
+        </div>
+        <div class="header-nav">
+            <a class="nav-btn" href="/">Dashboard</a>
+            <a class="nav-btn" href="/videos">Incident Videos</a>
+        </div>
+    </header>
+
+    <main class="main-container">
+        <section class="viewport-card" id="viewportCard">
+            <div class="viewport-header">
+                <div class="camera-info">
+                    <strong>Channel 01</strong>
+                    <span>•</span>
+                    <span class="ip-pill">CCTV IP: <span id="cctvIpDisplay">{{ cctv_ip }}</span></span>
+                </div>
+                <div id="clockDisplay">--:--:-- --</div>
+            </div>
+
+            <div class="video-wrapper" id="videoWrapper">
+                <img id="liveVideo" alt="Live Stream" />
+                <canvas id="snapshotCanvas" style="display:none;"></canvas>
+
+                <div class="hud-overlay">
+                    <div class="hud-top">
+                        <div class="hud-tag">CAM-01 • LIVE RTSP FEED</div>
+                        <div class="hud-tag" id="hudClock">--:--:--</div>
+                    </div>
+                    <div class="hud-bottom">
+                        <div class="hud-tag">
+                            <span>FPS: <strong id="hudFps">0.0</strong></span> | 
+                            <span>FRAMES: <strong id="hudFrames">0</strong></span>
+                        </div>
+                        <div class="hud-tag" id="hudRec">REC: ACTIVE</div>
+                    </div>
+                </div>
+
+                <div class="standby-overlay" id="standbyOverlay">
+                    <div class="radar-box">
+                        <div class="radar-dot"></div>
+                    </div>
+                    <div class="standby-title">Live Video Feed Offline</div>
+                    <p class="standby-desc">
+                        The ALERTO server is ready and listening for WebSocket streaming on <code>/ws/live-feed</code>.
+                        Ensure <code>main.py</code> is running on the local CCTV network.
+                    </p>
+                    <div class="code-snippet">python main.py</div>
+
+                </div>
+            </div>
+
+            <div class="controls-bar">
+                <div class="controls-left">
+                    <button class="ctrl-btn" onclick="captureSnapshot()" title="Capture High-Res Snapshot">
+                        📸 Snapshot
+                    </button>
+                    <button class="ctrl-btn" id="pauseBtn" onclick="togglePause()" title="Pause live rendering">
+                        ⏸ Pause
+                    </button>
+                    <button class="ctrl-btn" onclick="forceReconnect()" title="Reconnect WebSocket">
+                        🔄 Reconnect
+                    </button>
+                </div>
+                <div class="controls-right">
+                    <a class="ctrl-btn" href="/live/feed.mjpg" target="_blank" title="Direct MJPEG Stream">
+                        🔗 MJPEG Feed
+                    </a>
+                    <button class="ctrl-btn" onclick="toggleFullscreen()" title="Toggle Fullscreen">
+                        ⛶ Fullscreen
+                    </button>
+                </div>
+            </div>
+        </section>
+
+        <section class="recordings-card">
+            <div class="recordings-header">
+                <div>
+                    <div class="recordings-title">
+                        <span>🔴 Continuous Server Recordings</span>
+                    </div>
+                    <p style="font-size:12px; color:var(--text-muted); margin-top:4px;">
+                        The incoming live CCTV feed is continuously recorded and saved to server storage in rolling segments.
+                    </p>
+                </div>
+                <button class="ctrl-btn" onclick="fetchRecordings()" title="Refresh list">
+                    ↻ Refresh List
+                </button>
+            </div>
+
+            <div class="table-responsive">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>File Name</th>
+                            <th>Timestamp</th>
+                            <th>Size</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="recordingsTableBody">
+                        <tr>
+                            <td colspan="4" style="text-align:center; color:var(--text-muted); padding:24px;">
+                                Loading recorded video segments...
+                            </td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+    </main>
+
+    <div class="modal-backdrop" id="videoModal">
+        <div class="modal-box">
+            <div class="modal-header">
+                <span class="modal-title" id="modalVideoTitle">Watch Recording</span>
+                <button class="modal-close" onclick="closeModal()">&times;</button>
+            </div>
+            <div class="modal-video-wrap">
+                <video id="modalVideoPlayer" controls autoplay></video>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const liveImg = document.getElementById("liveVideo");
+        const standbyOverlay = document.getElementById("standbyOverlay");
+        const streamStatusPill = document.getElementById("streamStatusPill");
+        const streamStatusDot = document.getElementById("streamStatusDot");
+        const streamStatusText = document.getElementById("streamStatusText");
+        const fpsCounter = document.getElementById("fpsCounter");
+        const hudFps = document.getElementById("hudFps");
+        const hudFrames = document.getElementById("hudFrames");
+        const hudClock = document.getElementById("hudClock");
+        const hudRec = document.getElementById("hudRec");
+        const clockDisplay = document.getElementById("clockDisplay");
+        const cctvIpDisplay = document.getElementById("cctvIpDisplay");
+        const pauseBtn = document.getElementById("pauseBtn");
+
+        let ws = null;
+        let activeBlobUrl = null;
+        let isPaused = false;
+        let frameCount = 0;
+        let totalFramesReceived = 0;
+        let fpsTimer = null;
+        let reconnectDelay = 1000;
+        let hasReceivedFirstFrame = false;
+
+        function updateClock() {
+            const now = new Date();
+            const timeStr = now.toLocaleTimeString("en-US", { hour12: true });
+            const dateStr = now.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+            const fullClock = `${dateStr} — ${timeStr}`;
+            clockDisplay.innerText = fullClock;
+            hudClock.innerText = timeStr;
+        }
+        setInterval(updateClock, 1000);
+        updateClock();
+
+        fpsTimer = setInterval(() => {
+            const fps = frameCount;
+            fpsCounter.innerText = `${fps.toFixed(1)} FPS`;
+            hudFps.innerText = fps.toFixed(1);
+            frameCount = 0;
+        }, 1000);
+
+        function setStatus(online, message) {
+            if (online) {
+                streamStatusPill.className = "status-pill online";
+                streamStatusDot.className = "dot pulse";
+                streamStatusText.innerText = "STREAM LIVE";
+                standbyOverlay.classList.add("hidden");
+            } else {
+                streamStatusPill.className = "status-pill offline";
+                streamStatusDot.className = "dot";
+                streamStatusText.innerText = message || "FEED OFFLINE";
+                if (!hasReceivedFirstFrame) {
+                    standbyOverlay.classList.remove("hidden");
+                }
+            }
+        }
+
+        function connectWebSocket() {
+            const loc = window.location;
+            const protocol = loc.protocol === "https:" ? "wss:" : "ws:";
+            const wsUrl = `${protocol}//${loc.host}/ws/live`;
+
+            setStatus(false, "CONNECTING...");
+            try {
+                ws = new WebSocket(wsUrl);
+                ws.binaryType = "blob";
+
+                ws.onopen = function () {
+                    reconnectDelay = 1000;
+                };
+
+                ws.onmessage = function (event) {
+                    if (typeof event.data === "string") {
+                        try {
+                            const data = JSON.parse(event.data);
+                            if (data.type === "status") {
+                                if (data.cctv_ip) {
+                                    cctvIpDisplay.innerText = data.cctv_ip;
+                                }
+                                if (data.recording_file) {
+                                    hudRec.innerText = `REC: ${data.recording_file}`;
+                                }
+                                setStatus(Boolean(data.online), data.online ? "STREAM LIVE" : "FEED OFFLINE");
+                            }
+                        } catch (e) {}
+                    } else if (event.data instanceof Blob) {
+                        if (isPaused || document.visibilityState === "hidden") {
+                            return;
+                        }
+
+                        hasReceivedFirstFrame = true;
+                        setStatus(true);
+
+                        const newUrl = URL.createObjectURL(event.data);
+                        liveImg.src = newUrl;
+                        if (activeBlobUrl) {
+                            URL.revokeObjectURL(activeBlobUrl);
+                        }
+                        activeBlobUrl = newUrl;
+
+                        frameCount++;
+                        totalFramesReceived++;
+                        hudFrames.innerText = totalFramesReceived;
+                    }
+                };
+
+                ws.onclose = function () {
+                    setStatus(false, "DISCONNECTED");
+                    setTimeout(connectWebSocket, reconnectDelay);
+                    reconnectDelay = Math.min(reconnectDelay * 1.5, 5000);
+                };
+
+                ws.onerror = function () {
+                    ws.close();
+                };
+            } catch (err) {
+                setTimeout(connectWebSocket, 2000);
+            }
+        }
+
+        function forceReconnect() {
+            if (ws) {
+                try { ws.close(); } catch (e) {}
+            }
+            connectWebSocket();
+        }
+
+        function togglePause() {
+            isPaused = !isPaused;
+            pauseBtn.innerText = isPaused ? "▶ Resume" : "⏸ Pause";
+        }
+
+        function toggleFullscreen() {
+            const el = document.getElementById("videoWrapper");
+            if (!document.fullscreenElement) {
+                el.requestFullscreen().catch(() => {});
+            } else {
+                document.exitFullscreen().catch(() => {});
+            }
+        }
+
+        function captureSnapshot() {
+            if (!liveImg || !liveImg.naturalWidth) {
+                alert("No active camera frame to capture.");
+                return;
+            }
+            const canvas = document.getElementById("snapshotCanvas");
+            canvas.width = liveImg.naturalWidth;
+            canvas.height = liveImg.naturalHeight;
+            const ctx = canvas.getContext("2d");
+            ctx.drawImage(liveImg, 0, 0);
+
+            const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+            const link = document.createElement("a");
+            link.download = `cctv_snapshot_${timestamp}.jpg`;
+            link.href = canvas.toDataURL("image/jpeg", 0.95);
+            link.click();
+        }
+
+        function fetchRecordings() {
+            fetch("/live/recordings")
+                .then(r => r.json())
+                .then(data => {
+                    const tbody = document.getElementById("recordingsTableBody");
+                    if (!data.recordings || data.recordings.length === 0) {
+                        tbody.innerHTML = `<tr><td colspan="4" style="text-align:center; color:var(--text-muted); padding:20px;">No live recordings saved yet. Streaming will automatically record continuous segments.</td></tr>`;
+                        return;
+                    }
+
+                    tbody.innerHTML = data.recordings.map(rec => `
+                        <tr>
+                            <td><span class="rec-filename">${rec.filename}</span></td>
+                            <td>${rec.timestamp}</td>
+                            <td>${rec.size_mb} MB</td>
+                            <td>
+                                <div class="rec-actions">
+                                    <button class="rec-btn rec-btn-watch" onclick="watchRecording('${rec.filename}')">▶ Watch</button>
+                                    <a class="rec-btn" href="${rec.url}" download>⬇ Download</a>
+                                </div>
+                            </td>
+                        </tr>
+                    `).join("");
+                })
+                .catch(() => {});
+        }
+
+        function watchRecording(filename) {
+            const modal = document.getElementById("videoModal");
+            const title = document.getElementById("modalVideoTitle");
+            const player = document.getElementById("modalVideoPlayer");
+            title.innerText = filename;
+            player.src = `/live/recordings/${encodeURIComponent(filename)}`;
+            modal.classList.add("open");
+            player.play().catch(() => {});
+        }
+
+        function closeModal() {
+            const modal = document.getElementById("videoModal");
+            const player = document.getElementById("modalVideoPlayer");
+            player.pause();
+            player.src = "";
+            modal.classList.remove("open");
+        }
+
+        connectWebSocket();
+        fetchRecordings();
+        setInterval(fetchRecordings, 20000);
+    </script>
+</body>
+</html>
+"""
+
+
+@app.get("/live")
+def live_page():
+    return render_template_string(
+        LIVE_PAGE_HTML,
+        product_name=PRODUCT_NAME,
+        cctv_ip=CCTV_IP,
+        recording_enabled=LIVE_RECORDING_ENABLED,
+    )
+
+
+@sock.route("/ws/live-feed")
+def live_feed_inlet(ws):
+    logger.info("Live CCTV streamer connected to /ws/live-feed")
+    with live_stream_lock:
+        live_stream_meta["online"] = True
+        live_stream_meta["connected_at"] = datetime.now(MANILA_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
+        live_stream_meta["frames_received"] = 0
+        live_stream_meta["bytes_received"] = 0
+    broadcast_live_status()
+
+    frame_counter = 0
+    last_fps_calc = time.time()
+
+    try:
+        while True:
+            data = ws.receive()
+            if data is None:
+                break
+            if isinstance(data, str):
+                try:
+                    meta = json.loads(data)
+                    with live_stream_lock:
+                        if "cctv_ip" in meta:
+                            live_stream_meta["cctv_ip"] = str(meta["cctv_ip"])
+                        if "width" in meta:
+                            live_stream_meta["width"] = int(meta["width"])
+                        if "height" in meta:
+                            live_stream_meta["height"] = int(meta["height"])
+                        if "fps" in meta:
+                            live_stream_meta["fps"] = float(meta["fps"])
+                    broadcast_live_status()
+                except Exception:
+                    pass
+            elif isinstance(data, bytes):
+                frame_counter += 1
+                now = time.time()
+                if now - last_fps_calc >= 2.0:
+                    fps = frame_counter / (now - last_fps_calc)
+                    with live_stream_lock:
+                        live_stream_meta["fps"] = round(fps, 1)
+                    frame_counter = 0
+                    last_fps_calc = now
+
+                with latest_live_frame_lock:
+                    global latest_live_frame
+                    latest_live_frame = data
+
+                with live_stream_lock:
+                    live_stream_meta["frames_received"] += 1
+                    live_stream_meta["bytes_received"] += len(data)
+
+                # Broadcast to browser clients with non-blocking locks
+                broadcast_live_frame(data)
+
+                # Record frame to server storage
+                if LIVE_RECORDING_ENABLED:
+                    live_recorder.write_frame(data)
+    except Exception as err:
+        logger.warning("Live feed connection error: %s", err)
+    finally:
+        logger.info("Live CCTV streamer disconnected from /ws/live-feed")
+        with live_stream_lock:
+            live_stream_meta["online"] = False
+            live_stream_meta["fps"] = 0.0
+        broadcast_live_status()
+        if LIVE_RECORDING_ENABLED:
+            live_recorder.finalize_segment()
+
+
+@sock.route("/ws/live")
+def live_viewer_outlet(ws):
+    client_lock = threading.Lock()
+    with live_viewers_lock:
+        live_viewers[ws] = client_lock
+
+    try:
+        with client_lock:
+            with live_stream_lock:
+                status_payload = {
+                    "type": "status",
+                    **live_stream_meta,
+                    "viewers_count": len(live_viewers),
+                    "recording": live_recorder.is_active(),
+                    "recording_file": live_recorder.current_filename,
+                }
+            ws.send(json.dumps(status_payload))
+            with latest_live_frame_lock:
+                if latest_live_frame is not None:
+                    ws.send(latest_live_frame)
+
+        while True:
+            msg = ws.receive()
+            if msg is None:
+                break
+            if isinstance(msg, str) and "ping" in msg:
+                with client_lock:
+                    ws.send(json.dumps({"type": "pong", "time": time.time()}))
+    except Exception:
+        pass
+    finally:
+        with live_viewers_lock:
+            live_viewers.pop(ws, None)
+        broadcast_live_status()
+
+
+@app.get("/live/status")
+def live_status():
+    with live_stream_lock:
+        meta = dict(live_stream_meta)
+    with live_viewers_lock:
+        viewers_count = len(live_viewers)
+    rec_status = live_recorder.get_status()
+    return jsonify(
+        {
+            **meta,
+            "viewers_count": viewers_count,
+            "recording": rec_status,
+        }
+    )
+
+
+@app.get("/live/feed.mjpg")
+def live_mjpeg_stream():
+    def generate():
+        last_seen = None
+        while True:
+            with latest_live_frame_lock:
+                frame = latest_live_frame
+            if frame is not None and frame != last_seen:
+                last_seen = frame
+                yield (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n\r\n"
+                    + frame
+                    + b"\r\n"
+                )
+            time.sleep(0.04)
+
+    return Response(
+        generate(),
+        mimetype="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
+@app.get("/live/recordings")
+def list_live_recordings():
+    try:
+        files = sorted(
+            (p for p in UPLOAD_DIR.glob("*.mp4") if p.is_file()),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        recordings = []
+        for p in files[:60]:
+            mtime = datetime.fromtimestamp(
+                p.stat().st_mtime, tz=ZoneInfo("UTC")
+            ).astimezone(MANILA_TIMEZONE)
+            recordings.append(
+                {
+                    "filename": p.name,
+                    "size_mb": round(p.stat().st_size / (1024 * 1024), 2),
+                    "timestamp": mtime.strftime("%B %d, %Y — %I:%M:%S %p"),
+                    "url": f"/live/recordings/{p.name}",
+                }
+            )
+        return jsonify(recordings=recordings)
+    except Exception as e:
+        return jsonify(error=str(e), recordings=[]), 500
+
+
+@app.get("/live/recordings/<path:filename>")
+def download_live_recording(filename):
+    safe_filename = Path(filename)
+    if safe_filename.name != filename or not safe_filename.name.lower().endswith(
+        ".mp4"
+    ):
+        abort(404)
+    video_path = UPLOAD_DIR / safe_filename.name
+    if not video_path.is_file():
+        abort(404)
+    return send_from_directory(
+        UPLOAD_DIR, safe_filename.name, mimetype="video/mp4"
+    )
 
 
 @app.errorhandler(413)

@@ -9,6 +9,8 @@ from datetime import datetime
 from pathlib import Path
 
 import requests
+import cv2
+import websocket
 
 logging.basicConfig(
     level=logging.INFO,
@@ -111,6 +113,38 @@ VIDEO_DURATION_SECONDS = int(os.getenv("VIDEO_DURATION_SECONDS", "60"))
 CCTV_IP = os.getenv("CCTV_IP", "192.168.100.57")
 RTSP_USER = os.getenv("RTSP_USER", "admin")
 RTSP_PASS = os.getenv("RTSP_PASS", "password")
+ENABLE_LIVE_STREAM = os.getenv("ENABLE_LIVE_STREAM", "true").lower() in {"1", "true", "yes", "on"}
+LIVE_STREAM_FPS = int(os.getenv("LIVE_STREAM_FPS", "15"))
+LIVE_STREAM_QUALITY = int(os.getenv("LIVE_STREAM_QUALITY", "75"))
+
+
+def get_ffmpeg_executable():
+    path = shutil.which(FFMPEG_PATH)
+    if path:
+        return path
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+
+def resolve_server_ws_url(vps_endpoint):
+    url = str(vps_endpoint or "").strip().rstrip("/")
+    if url.endswith("/upload"):
+        url = url[:-len("/upload")]
+    if url.startswith("http://"):
+        ws = "ws://" + url[len("http://"):]
+    elif url.startswith("https://"):
+        ws = "wss://" + url[len("https://"):]
+    elif url.startswith("ws://") or url.startswith("wss://"):
+        ws = url
+    else:
+        ws = f"ws://{url}" if url else "ws://alerto.ddns.net"
+    if not ws.endswith("/ws/live-feed"):
+        ws = f"{ws}/ws/live-feed"
+    return ws
+
 
 
 def report_event_status(event_id, status, error=""):
@@ -162,7 +196,8 @@ def get_live_rtsp_url(cctv_ip=None):
 
 def record_cctv_stream(filename, duration_seconds, cctv_ip=None):
     rtsp_url = get_live_rtsp_url(cctv_ip)
-    if not rtsp_url or shutil.which(FFMPEG_PATH) is None:
+    ffmpeg_bin = get_ffmpeg_executable()
+    if not rtsp_url or not ffmpeg_bin:
         logger.error("Recording skipped: RTSP URL or FFmpeg is unavailable")
         return False
 
@@ -175,7 +210,7 @@ def record_cctv_stream(filename, duration_seconds, cctv_ip=None):
     try:
         result = subprocess.run(
             [
-                FFMPEG_PATH,
+                ffmpeg_bin,
                 "-y",
                 "-rtsp_transport",
                 "tcp",
@@ -299,6 +334,124 @@ def process_event(event):
     report_event_status(event_id, "completed")
 
 
+def run_live_stream_service():
+    """Continuously captures CCTV frames and streams them to the server via WebSocket."""
+    logger.info("Live streaming background service started")
+    encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), LIVE_STREAM_QUALITY]
+    frame_interval = 1.0 / max(1, LIVE_STREAM_FPS)
+
+    while True:
+        current_ip = os.getenv("CCTV_IP", CCTV_IP)
+        server_endpoint = os.getenv("VPS_ENDPOINT", VPS_ENDPOINT)
+        ws_url = resolve_server_ws_url(server_endpoint)
+
+        try:
+            rtsp_url = get_live_rtsp_url(current_ip)
+        except Exception as err:
+            logger.warning("Live stream waiting for CCTV configuration: %s", err)
+            time.sleep(5)
+            continue
+
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+        cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        if not cap.isOpened():
+            logger.warning(
+                "Live stream: CCTV RTSP not reachable (%s). Retrying in 5s...",
+                rtsp_url,
+            )
+            time.sleep(5)
+            continue
+
+        logger.info(
+            "Live stream: CCTV RTSP connected (%s). Connecting to server WebSocket: %s",
+            rtsp_url,
+            ws_url,
+        )
+        ws = None
+        try:
+            ws = websocket.create_connection(ws_url, timeout=10)
+            init_payload = {
+                "type": "init",
+                "cctv_ip": current_ip,
+                "fps": LIVE_STREAM_FPS,
+                "width": int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 1280),
+                "height": int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 720),
+                "timestamp": datetime.now().isoformat(),
+            }
+            ws.send(json.dumps(init_payload))
+            logger.info("Live stream: Successfully connected to server WebSocket inlet")
+        except Exception as ws_err:
+            logger.warning(
+                "Live stream: Could not connect to server WebSocket (%s): %s. Retrying in 3s...",
+                ws_url,
+                ws_err,
+            )
+            cap.release()
+            time.sleep(3)
+            continue
+
+        frame_counter = 0
+        last_stat_log = time.time()
+        active_ip = current_ip
+
+        try:
+            while True:
+                # If CCTV_IP was updated by server sync, reconnect to new IP
+                new_ip = os.getenv("CCTV_IP", CCTV_IP)
+                if new_ip != active_ip:
+                    logger.info(
+                        "CCTV_IP updated (%s -> %s). Reconnecting live stream...",
+                        active_ip,
+                        new_ip,
+                    )
+                    break
+
+                tick_start = time.time()
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    time.sleep(0.02)
+                    continue
+
+                ret, jpeg_buf = cv2.imencode(".jpg", frame, encode_params)
+                if not ret:
+                    continue
+
+                ws.send_binary(jpeg_buf.tobytes())
+                frame_counter += 1
+
+                now = time.time()
+                if now - last_stat_log >= 15.0:
+                    fps = frame_counter / (now - last_stat_log)
+                    logger.info("Live stream active: %.1f FPS to server", fps)
+                    frame_counter = 0
+                    last_stat_log = now
+
+                elapsed = time.time() - tick_start
+                sleep_time = frame_interval - elapsed
+                if sleep_time > 0.001:
+                    time.sleep(sleep_time)
+
+        except Exception as stream_err:
+            logger.warning(
+                "Live stream connection interrupted: %s. Reconnecting in 3s...",
+                stream_err,
+            )
+        finally:
+            if ws:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+            if cap:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+            time.sleep(3)
+
+
 def _configuration_sync_loop():
     """Refresh configuration without blocking event polling."""
     while True:
@@ -356,5 +509,7 @@ def poll_events():
 
 if __name__ == "__main__":
     threading.Thread(target=_configuration_sync_loop, name="config-sync", daemon=True).start()
-    logger.info("ALERTO video worker started")
-    poll_events()
+    if ENABLE_LIVE_STREAM:
+        threading.Thread(target=run_live_stream_service, name="live-stream", daemon=True).start()
+    logger.info("ALERTO video worker started (event polling + continuous live streaming)")
+    poll_events()
